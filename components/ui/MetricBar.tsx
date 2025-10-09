@@ -16,7 +16,7 @@ export default function MetricBar({
   return (
     <View className="bg-surface rounded-2xl p-4 border border-border mb-3">
       <View className="flex-row items-center justify-between">
-        <View className="flex-1">
+        <View className="flex-1 pr-3">
           <Text className="text-text font-medium">{title}</Text>
           {sub ? <Text className="text-text-muted text-xs mt-1">{sub}</Text> : null}
         </View>
@@ -26,6 +26,7 @@ export default function MetricBar({
           </View>
         ) : null}
       </View>
+
       <View className="h-2 w-full bg-surface2 rounded-pill mt-3 overflow-hidden">
         <View style={{ width: `${percent}%`, backgroundColor: color }} className="h-2 rounded-pill" />
       </View>
