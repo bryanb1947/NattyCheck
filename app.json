@@ -1,0 +1,15 @@
+// app.json
+{
+  "expo": {
+    "name": "NattyCheck",
+    "slug": "nattycheck",
+    "scheme": "nattycheck",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "splash": { "image": "./assets/splash.png", "resizeMode": "contain", "backgroundColor": "#0F0F0F" },
+    "assetBundlePatterns": ["**/*"],
+    "plugins": ["expo-router"],
+    "experiments": { "typedRoutes": true }
+  }
+}
