@@ -1,30 +1,73 @@
-import { View, Text, ScrollView } from "react-native";
+import React from "react";
+import { SafeAreaView, View, Text, StyleSheet, TouchableOpacity } from "react-native";
+import { LinearGradient } from "expo-linear-gradient";
 import { router } from "expo-router";
-import Card from "../components/ui/Card";
-import GradientButton from "../components/ui/GradientButton";
 
 export default function Onboarding() {
   return (
-    <ScrollView className="flex-1 bg-background px-6 pt-16" contentContainerStyle={{ paddingBottom: 28 }}>
-      <View className="items-center mb-8">
-        <View className="w-20 h-20 rounded-full items-center justify-center" style={{ backgroundColor: "#0F3530" }}>
-          <Text className="text-text text-2xl">⚡</Text>
+    <SafeAreaView style={styles.safe}>
+      <View style={styles.container}>
+        {/* Card */}
+        <View style={styles.card}>
+          {/* Brand icon */}
+          <LinearGradient colors={["#00FFE0", "#B8FF47"]} start={{ x: 0, y: 0.5 }} end={{ x: 1, y: 0.5 }} style={styles.logoCircle}>
+            <Text style={styles.logoBolt}>⚡</Text>
+          </LinearGradient>
+
+          <Text style={styles.title}>NattyCheck</Text>
+          <Text style={styles.subtitle}>
+            AI-powered physique analysis and personalized training recommendations
+          </Text>
+
+          {/* Get Started */}
+          <TouchableOpacity activeOpacity={0.9} onPress={() => router.push("/signup")} style={{ width: "100%", marginTop: 20 }}>
+            <LinearGradient
+              colors={["#00FFE0", "#B8FF47"]}
+              start={{ x: 0, y: 0.5 }}
+              end={{ x: 1, y: 0.5 }}
+              style={styles.cta}
+            >
+              <Text style={styles.ctaText}>Get Started</Text>
+            </LinearGradient>
+          </TouchableOpacity>
+
+          {/* Login link */}
+          <TouchableOpacity onPress={() => router.push("/login")} style={{ marginTop: 12 }}>
+            <Text style={styles.linkText}>I have an account</Text>
+          </TouchableOpacity>
         </View>
-        <Text className="text-text font-display text-3xl mt-4">NattyCheck</Text>
-        <Text className="text-text-muted mt-2 text-center">
-          AI-powered physique analysis and personalized training recommendations
-        </Text>
       </View>
-
-      <Card>
-        <Text className="text-text font-medium mb-3">How it works</Text>
-        <Text className="text-text-muted">• Upload or capture 3 photos (front, side, back)</Text>
-        <Text className="text-text-muted mt-1">• Get an instant breakdown of strengths & lagging areas</Text>
-        <Text className="text-text-muted mt-1">• Receive a suggested split and a playful “natty” check</Text>
-      </Card>
-
-      <GradientButton title="Get Started" style={{ marginTop: 16 }} onPress={() => router.push("/analyze")} />
-      <Text className="text-text-muted text-center mt-3">I have an account</Text>
-    </ScrollView>
+    </SafeAreaView>
   );
 }
+
+const styles = StyleSheet.create({
+  safe: { flex: 1, backgroundColor: "#0F0F0F" },
+  container: { flex: 1, paddingHorizontal: 20, justifyContent: "center" },
+  card: {
+    backgroundColor: "#151515",
+    borderColor: "#2A2A2A",
+    borderWidth: 1,
+    borderRadius: 20,
+    padding: 24,
+    shadowColor: "#000",
+    shadowOpacity: 0.35,
+    shadowRadius: 18,
+    shadowOffset: { width: 0, height: 8 },
+  },
+  logoCircle: {
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    alignItems: "center",
+    justifyContent: "center",
+    alignSelf: "center",
+    marginBottom: 18,
+  },
+  logoBolt: { fontSize: 28, color: "#0F0F0F", fontWeight: "800" },
+  title: { color: "#fff", fontSize: 24, fontWeight: "700", textAlign: "center" },
+  subtitle: { color: "#B3B3B3", marginTop: 8, textAlign: "center", lineHeight: 20 },
+  cta: { borderRadius: 999, paddingVertical: 14, alignItems: "center", justifyContent: "center" },
+  ctaText: { color: "#0F0F0F", fontWeight: "700", fontSize: 16 },
+  linkText: { color: "#FFFFFF", textAlign: "center", fontWeight: "600" },
+});

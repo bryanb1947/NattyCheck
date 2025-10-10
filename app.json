@@ -20,13 +20,11 @@
       "permissions": ["CAMERA", "READ_EXTERNAL_STORAGE", "WRITE_EXTERNAL_STORAGE"]
     },
     "plugins": [
-      "expo-dev-client",
       ["expo-camera", { "cameraPermission": "Allow NattyCheck to access your camera for physique analysis." }],
       ["expo-image-picker", { "photosPermission": "Allow NattyCheck to access your photo library to upload physique images." }]
-      // No special config required for expo-face-detector
     ],
     "extra": {
-      "eas": { "projectId": "72775517-8816-4db0-a8b8-f8a8938aff48" }
+      "eas": { "projectId": "REPLACE_WITH_YOUR_EAS_PROJECT_ID" }
     }
   }
 }

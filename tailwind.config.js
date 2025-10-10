@@ -13,6 +13,8 @@ module.exports = {
         aqua: "#00FFE0",
         cyan: "#00E0FF",
         danger: "#FF5277",
+        success: "#A4FF4A",
+        info: "#00FFAE",
       },
       borderRadius: { xl: "16px", "2xl": "20px", pill: "999px" },
       boxShadow: { card: "0 8px 28px rgba(0,0,0,0.35)" },

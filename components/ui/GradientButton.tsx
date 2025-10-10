@@ -2,15 +2,19 @@ import { Pressable, Text, ViewStyle } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import { gradientLR } from "../../constants/theme";
 
-type Props = {
+export default function GradientButton({
+  title,
+  onPress,
+  disabled,
+  style,
+  iconLeft,
+}: {
   title: string;
   onPress?: () => void;
   disabled?: boolean;
   style?: ViewStyle;
   iconLeft?: React.ReactNode;
-};
-
-export default function GradientButton({ title, onPress, disabled, style, iconLeft }: Props) {
+}) {
   return (
     <Pressable onPress={onPress} disabled={disabled} style={style} className={`${disabled ? "opacity-50" : ""}`}>
       <LinearGradient
