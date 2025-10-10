@@ -1,15 +1,32 @@
-// app.json
 {
   "expo": {
     "name": "NattyCheck",
     "slug": "nattycheck",
-    "scheme": "nattycheck",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
-    "splash": { "image": "./assets/splash.png", "resizeMode": "contain", "backgroundColor": "#0F0F0F" },
+    "scheme": "nattycheck",
+    "userInterfaceStyle": "dark",
     "assetBundlePatterns": ["**/*"],
-    "plugins": ["expo-router"],
-    "experiments": { "typedRoutes": true }
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.yourcompany.nattycheck",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Allow NattyCheck to take photos for physique analysis.",
+        "NSPhotoLibraryUsageDescription": "Allow NattyCheck to access your photo library to upload physique images."
+      }
+    },
+    "android": {
+      "package": "com.yourcompany.nattycheck",
+      "permissions": ["CAMERA", "READ_EXTERNAL_STORAGE", "WRITE_EXTERNAL_STORAGE"]
+    },
+    "plugins": [
+      "expo-dev-client",
+      ["expo-camera", { "cameraPermission": "Allow NattyCheck to access your camera for physique analysis." }],
+      ["expo-image-picker", { "photosPermission": "Allow NattyCheck to access your photo library to upload physique images." }]
+      // No special config required for expo-face-detector
+    ],
+    "extra": {
+      "eas": { "projectId": "REPLACE_WITH_YOUR_EAS_PROJECT_ID" }
+    }
   }
 }
