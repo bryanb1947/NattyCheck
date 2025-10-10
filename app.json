@@ -26,7 +26,7 @@
       // No special config required for expo-face-detector
     ],
     "extra": {
-      "eas": { "projectId": "REPLACE_WITH_YOUR_EAS_PROJECT_ID" }
+      "eas": { "projectId": "72775517-8816-4db0-a8b8-f8a8938aff48" }
     }
   }
 }
