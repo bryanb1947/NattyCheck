@@ -2,29 +2,30 @@
   "expo": {
     "name": "NattyCheck",
     "slug": "nattycheck",
+    "scheme": "nattycheck",
     "version": "1.0.0",
     "orientation": "portrait",
-    "scheme": "nattycheck",
-    "userInterfaceStyle": "dark",
+    "icon": "./assets/icon.png",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0F0F0F"
+    },
     "assetBundlePatterns": ["**/*"],
     "ios": {
-      "supportsTablet": true,
-      "bundleIdentifier": "com.yourcompany.nattycheck",
+      "supportsTablet": false,
       "infoPlist": {
         "NSCameraUsageDescription": "Allow NattyCheck to take photos for physique analysis.",
-        "NSPhotoLibraryUsageDescription": "Allow NattyCheck to access your photo library to upload physique images."
+        "NSPhotoLibraryAddUsageDescription": "Allow NattyCheck to save analysis photos to your library.",
+        "NSPhotoLibraryUsageDescription": "Allow NattyCheck to access your library when selecting images."
       }
     },
     "android": {
-      "package": "com.yourcompany.nattycheck",
-      "permissions": ["CAMERA", "READ_EXTERNAL_STORAGE", "WRITE_EXTERNAL_STORAGE"]
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0F0F0F"
+      }
     },
-    "plugins": [
-      ["expo-camera", { "cameraPermission": "Allow NattyCheck to access your camera for physique analysis." }],
-      ["expo-image-picker", { "photosPermission": "Allow NattyCheck to access your photo library to upload physique images." }]
-    ],
-    "extra": {
-      "eas": { "projectId": "REPLACE_WITH_YOUR_EAS_PROJECT_ID" }
-    }
+    "plugins": []
   }
 }

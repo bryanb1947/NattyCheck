@@ -1,65 +1,51 @@
-import React, { useEffect, useState, useMemo } from "react";
-import { SafeAreaView, ScrollView, View, Text, StyleSheet, TouchableOpacity, Share, Alert } from "react-native";
+import React, { useMemo } from "react";
+import { SafeAreaView, ScrollView, View, Text, StyleSheet, TouchableOpacity, Share } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import { useLocalSearchParams, router } from "expo-router";
-import { Api } from "../lib/api";
 
 type ResultJson = {
   completedAt?: string;
-  confidence?: number;
+  confidence?: number;  // 0..1
   overallScore?: number;
   summary?: { upperBody?: number; lowerBody?: number; symmetry?: number; posture?: number };
   natty?: { status?: string; confidence?: number };
 };
 
 export default function Results() {
-  const { jobId } = useLocalSearchParams<{ jobId?: string }>();
-  const [data, setData] = useState<ResultJson | null>(null);
-
-  useEffect(() => {
-    let mounted = true;
-    (async () => {
-      if (!jobId) return;
-      try {
-        const job = await Api.job(jobId);
-        if (mounted) setData(job?.results ?? null);
-      } catch (e:any) {
-        Alert.alert("Error", e?.message ?? "Failed to load results.");
-      }
-    })();
-    return () => { mounted = false; };
-  }, [jobId]);
+  const { payload } = useLocalSearchParams<{ payload?: string }>();
+  const data: ResultJson | null = useMemo(() => {
+    try { return payload ? JSON.parse(payload) : null; } catch { return null; }
+  }, [payload]);
 
   const dateLabel = useMemo(() => {
     if (!data?.completedAt) return "";
-    try { return new Date(data.completedAt).toLocaleDateString(undefined, { year:"numeric", month:"short", day:"numeric" }); }
+    try { return new Date(data.completedAt).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }); }
     catch { return ""; }
   }, [data?.completedAt]);
-
-  const onShare = async () => {
-    if (!data) return;
-    const s = data.summary || {};
-    const msg = `NattyCheck • Score ${data.overallScore ?? "-"}\nUpper: ${s.upperBody ?? "-"}  Lower: ${s.lowerBody ?? "-"}\nSymmetry: ${s.symmetry ?? "-"}  Confidence: ${Math.round((data.confidence ?? 0) * 100)}%`;
-    try { await Share.share({ message: msg }); } catch {}
-  };
 
   const score = data?.overallScore ?? 0;
   const s = data?.summary ?? {};
   const nattyStatus = data?.natty?.status ?? "NATURAL";
   const confPct = Math.round((data?.confidence ?? 0) * 100);
 
+  const onShare = async () => {
+    if (!data) return;
+    const msg = `NattyCheck • Score ${score}\nUpper: ${s.upperBody ?? "-"}  Lower: ${s.lowerBody ?? "-"}\nSymmetry: ${s.symmetry ?? "-"}  Confidence: ${confPct}%`;
+    try { await Share.share({ message: msg }); } catch {}
+  };
+
   return (
     <SafeAreaView style={styles.safe}>
       <ScrollView style={styles.scroll} contentContainerStyle={styles.content}>
         <View style={styles.cardOuter}>
-          <LinearGradient colors={["#0C2321", "#0D0F10"]} start={{x:0,y:0}} end={{x:1,y:1}} style={styles.card}>
+          <LinearGradient colors={["#0C2321", "#0D0F10"]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.card}>
             <View style={styles.topRow}>
               <View style={styles.badge}><Text style={styles.badgeText}>N</Text></View>
               {dateLabel ? <View style={styles.datePill}><Text style={styles.datePillText}>{dateLabel}</Text></View> : null}
             </View>
 
             <View style={styles.scoreWrap}>
-              <LinearGradient colors={["#12E1D6", "#B8FF47"]} start={{x:0,y:0}} end={{x:1,y:1}} style={styles.scoreRing}>
+              <LinearGradient colors={["#12E1D6", "#B8FF47"]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.scoreRing}>
                 <View style={styles.scoreInner}>
                   <Text style={styles.scoreText}>{score}</Text>
                   <Text style={styles.scoreLabel}>Score</Text>
@@ -84,29 +70,18 @@ export default function Results() {
           </LinearGradient>
         </View>
 
-        {/* Actions */}
         <View style={{ height: 12 }} />
         <View style={styles.actions}>
-          <TouchableOpacity onPress={() => router.replace("/(tabs)/analyze")} style={styles.actionBtn}>
-            <Text style={styles.actionText}>Retake</Text>
+          <TouchableOpacity onPress={() => router.replace("/(tabs)")} style={styles.actionBtn}>
+            <Text style={styles.actionText}>Back to Dashboard</Text>
           </TouchableOpacity>
-
           <TouchableOpacity onPress={onShare} style={styles.actionBtn}>
             <Text style={styles.actionText}>Share</Text>
           </TouchableOpacity>
-
-          <TouchableOpacity style={styles.actionBtnPrimary} onPress={() => router.push({ pathname: "/paywall", params: { from: "/results" } })}>
+          <TouchableOpacity onPress={() => router.replace("/(tabs)/analyze")} style={styles.actionBtnPrimary}>
             <LinearGradient colors={["#00FFE0", "#B8FF47"]} start={{ x: 0, y: 0.5 }} end={{ x: 1, y: 0.5 }} style={styles.actionBtnPrimaryFill}>
-              <Text style={styles.actionPrimaryText}>Upgrade</Text>
+              <Text style={styles.actionPrimaryText}>Retake</Text>
             </LinearGradient>
-          </TouchableOpacity>
-
-          <TouchableOpacity onPress={() => router.push("/results-details")} style={styles.actionBtn}>
-            <Text style={styles.actionText}>View Details</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity onPress={() => router.replace("/(tabs)/index")} style={styles.actionBtnGhost}>
-            <Text style={styles.actionGhostText}>Back to Dashboard</Text>
           </TouchableOpacity>
         </View>
 
@@ -160,6 +135,4 @@ const styles = StyleSheet.create({
   actionBtnPrimary: { borderRadius: 14, overflow: "hidden" },
   actionBtnPrimaryFill: { height: 52, alignItems: "center", justifyContent: "center" },
   actionPrimaryText: { color: "#0A0A0A", fontWeight: "800" },
-  actionBtnGhost: { height: 52, borderRadius: 14, alignItems: "center", justifyContent: "center" },
-  actionGhostText: { color: "#8AA0A7", fontWeight: "700" },
 });

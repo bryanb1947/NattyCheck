@@ -1,79 +1,83 @@
 import React, { useEffect, useRef, useState } from "react";
-import { SafeAreaView, View, Text, StyleSheet, Animated } from "react-native";
-import { router, useLocalSearchParams } from "expo-router";
+import { SafeAreaView, View, Text, StyleSheet, Animated, Alert } from "react-native";
+import { LinearGradient } from "expo-linear-gradient";
+import { useLocalSearchParams, router } from "expo-router";
 import { Api } from "../lib/api";
 
-export default function Analyzing() {
-  const { jobId } = useLocalSearchParams<{ jobId?: string }>();
-  const [percent, setPercent] = useState(0);
-  const progressAnim = useRef(new Animated.Value(0)).current;
+type Params = { frontUri?: string; sideUri?: string; backUri?: string };
 
-  // Fake visual progress bar (independent of server state)
+export default function Analyzing() {
+  const { frontUri, sideUri, backUri } = useLocalSearchParams<Params>();
+  const progressAnim = useRef(new Animated.Value(0)).current;
+  const [started, setStarted] = useState(false);
+
+  // Smooth fake progress while uploading/analyzing
   useEffect(() => {
-    const id = setInterval(() => {
-      setPercent((p) => {
-        const next = Math.min(95, p + 2); // stop at 95% until server says done
-        Animated.timing(progressAnim, { toValue: next, duration: 300, useNativeDriver: false }).start();
-        return next;
-      });
-    }, 400);
-    return () => clearInterval(id);
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(progressAnim, { toValue: 0.7, duration: 2000, useNativeDriver: false }),
+        Animated.timing(progressAnim, { toValue: 0.85, duration: 1800, useNativeDriver: false }),
+      ])
+    );
+    loop.start();
+    return () => loop.stop();
   }, [progressAnim]);
 
-  // Poll the job until done
   useEffect(() => {
-    if (!jobId) return;
-    let stop = false;
+    if (started) return;
+    if (!frontUri || !sideUri || !backUri) {
+      Alert.alert("Missing photos", "Please capture front, side, and back first.");
+      router.replace("/(tabs)/analyze");
+      return;
+    }
+    setStarted(true);
 
-    const tick = async () => {
+    (async () => {
       try {
-        const job = await Api.job(jobId);
-        if (job.status === "done") {
-          Animated.timing(progressAnim, { toValue: 100, duration: 300, useNativeDriver: false }).start(() => {
-            router.replace({ pathname: "/results", params: { jobId } });
-          });
-          return;
-        }
-        if (job.status === "failed" || job.status === "needs_retakes") {
-          router.replace({ pathname: "/(tabs)/analyze" });
-          return;
-        }
-      } catch {
-        // ignore and keep polling a bit
+        const result = await Api.analyzeWithFiles(frontUri, sideUri, backUri);
+        Animated.timing(progressAnim, { toValue: 1, duration: 500, useNativeDriver: false }).start(() => {
+          router.replace({ pathname: "/results", params: { payload: JSON.stringify(result) } });
+        });
+      } catch (e: any) {
+        Alert.alert("Analysis error", e?.message ?? "Please try again.");
+        router.replace("/(tabs)/analyze");
       }
-      if (!stop) setTimeout(tick, 1000);
-    };
+    })();
+  }, [started, frontUri, sideUri, backUri, progressAnim]);
 
-    tick();
-    return () => { stop = true; };
-  }, [jobId, progressAnim]);
-
-  const barWidth = progressAnim.interpolate({ inputRange: [0, 100], outputRange: ["0%", "100%"] });
+  const pct = Math.round(((progressAnim as any).__getValue?.() ?? 0) * 100);
 
   return (
-    <SafeAreaView style={styles.safe}>
-      <View style={styles.wrap}>
-        <View style={styles.card}>
-          <Text style={styles.title}>Analyzing Your Physique</Text>
-          <Text style={styles.subtitle}>Detecting proportions and posture…</Text>
-          <View style={styles.progressTrack}><Animated.View style={[styles.progressFill, { width: barWidth }]} /></View>
-          <Text style={styles.percentText}>{Math.round(percent)}%</Text>
+    <SafeAreaView style={s.safe}>
+      <View style={s.card}>
+        <View style={s.iconWrap}>
+          <LinearGradient colors={["#12E1D6", "#0EA371"]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={s.iconRing}>
+            <View style={s.iconInner}><Text style={s.iconBolt}>⚡️</Text></View>
+          </LinearGradient>
         </View>
+        <Text style={s.h1}>Analyzing Your Physique</Text>
+        <Text style={s.sub}>Detecting proportions, symmetry, and posture…</Text>
+        <View style={s.barBg}>
+          <Animated.View style={[s.barFill, {
+            width: progressAnim.interpolate({ inputRange: [0, 1], outputRange: ["0%", "100%"] })
+          }]} />
+        </View>
+        <Text style={s.pct}>{pct}% complete</Text>
       </View>
     </SafeAreaView>
   );
 }
 
-const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: "#0F0F0F" },
-  wrap: { flex: 1, padding: 20, alignItems: "center", justifyContent: "center" },
-  card: {
-    width: "100%", maxWidth: 520, backgroundColor: "#151515", borderColor: "#2A2A2A",
-    borderWidth: 1, borderRadius: 24, paddingVertical: 28, paddingHorizontal: 20, alignItems: "center"
-  },
-  title: { color: "#FFFFFF", fontSize: 18, fontWeight: "700" },
-  subtitle: { color: "#B3B3B3", textAlign: "center", marginTop: 8 },
-  progressTrack: { width: "100%", height: 10, backgroundColor: "#223034", borderRadius: 999, overflow: "hidden", marginTop: 14 },
-  progressFill: { height: "100%", backgroundColor: "#12E1D6" },
-  percentText: { color: "#B3B3B3", marginTop: 8 },
+const s = StyleSheet.create({
+  safe: { flex: 1, backgroundColor: "#0F0F0F", padding: 16 },
+  card: { flex: 1, borderRadius: 20, borderWidth: 1, borderColor: "#173236", backgroundColor: "#0B0E0F", padding: 20, alignItems: "center", justifyContent: "center" },
+  iconWrap: { marginBottom: 18 },
+  iconRing: { width: 110, height: 110, borderRadius: 999, padding: 4, alignItems: "center", justifyContent: "center" },
+  iconInner: { width: 102, height: 102, borderRadius: 999, backgroundColor: "#0F1719", alignItems: "center", justifyContent: "center" },
+  iconBolt: { fontSize: 28, color: "#A8FFE7" },
+  h1: { color: "#fff", fontSize: 20, fontWeight: "800", textAlign: "center" },
+  sub: { color: "#9DB1B5", textAlign: "center", marginTop: 6 },
+  barBg: { width: "100%", height: 8, backgroundColor: "#1A2326", borderRadius: 8, overflow: "hidden", marginTop: 16 },
+  barFill: { height: 8, backgroundColor: "#1DE3D2" },
+  pct: { color: "#8FA3A8", marginTop: 8 },
 });
