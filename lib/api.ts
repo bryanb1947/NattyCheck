@@ -1,123 +1,58 @@
-// lib/api.ts
-// Single place for all network calls. Provides safe fallbacks so the app
-// doesn't crash if the backend isn't running.
+import { API_BASE, REQUEST_TIMEOUT_MS } from "./config";
+import * as FileSystem from "expo-file-system";
 
-const BASE_URL =
-  process.env.EXPO_PUBLIC_API_URL?.replace(/\/+$/, "") || "";
-
-// -------- Types you can tweak later ----------
-export type AnalyzeRequest = {
+export type AnalysisRequest = {
   frontUri: string;
   sideUri: string;
   backUri: string;
+  legsUri: string;
+  userId?: string;
 };
 
-export type QueueResponse = { jobId: string };
+export type MuscleRegion =
+  | "shoulders" | "chest" | "lats" | "traps" | "quads" | "hamstrings" | "glutes" | "calves";
 
-export type JobStatus =
-  | "queued"
-  | "processing"
-  | "done"
-  | "error";
+export type RegionStatus = "balanced" | "strong" | "lagging";
 
-export type JobResponse = {
-  status: JobStatus;
-  // When done, return a report payload your results screen can read
-  report?: any;
-  error?: string;
+export type AnalysisResult = {
+  id: string;
+  completedAt: string;  // ISO
+  score: number;        // 0..100
+  confidence: number;   // 0..1
+  natty: boolean;
+  summary: string;
+  regions: Array<{ key: MuscleRegion; status: RegionStatus; percent: number }>;
+  posture?: { spinalAlignmentDeltaDeg?: number; scapularBalance?: "Symmetrical" | "Asymmetric" };
+  charts?: { shoulderToWaistRatio?: Array<{ month: string; value: number }> };
 };
 
-// -------- Helpers ----------
-async function uploadMultipart(
-  url: string,
-  { frontUri, sideUri, backUri }: AnalyzeRequest
-): Promise<QueueResponse> {
-  const form = new FormData();
-
-  const file = (uri: string, name: string) =>
-    ({
-      uri,
-      name,
-      type: "image/jpeg",
-    } as any);
-
-  form.append("front", file(frontUri, "front.jpg"));
-  form.append("side", file(sideUri, "side.jpg"));
-  form.append("back", file(backUri, "back.jpg"));
-
-  const res = await fetch(url, {
-    method: "POST",
-    body: form,
-    headers: {
-      // NOTE: Do NOT set Content-Type here; fetch will set multipart boundary
-    },
+function timeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("Request timed out")), ms);
+    p.then(v => { clearTimeout(t); resolve(v); }, e => { clearTimeout(t); reject(e); });
   });
+}
+
+export async function analyzePhysique(payload: AnalysisRequest): Promise<AnalysisResult> {
+  const form = new FormData();
+  form.append("front", { uri: payload.frontUri, name: "front.jpg", type: "image/jpeg" } as any);
+  form.append("side",  { uri: payload.sideUri,  name: "side.jpg",  type: "image/jpeg" } as any);
+  form.append("back",  { uri: payload.backUri,  name: "back.jpg",  type: "image/jpeg" } as any);
+  form.append("legs",  { uri: payload.legsUri,  name: "legs.jpg",  type: "image/jpeg" } as any);
+  if (payload.userId) form.append("userId", payload.userId);
+
+  const res = await timeout(fetch(`${API_BASE}/analyze`, {
+    method: "POST",
+    headers: { Accept: "application/json" },
+    body: form,
+  }), REQUEST_TIMEOUT_MS);
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`Analyze failed (${res.status}): ${text}`);
+    throw new Error(`Analyze failed: ${res.status} ${text}`);
   }
+  const json = await res.json();
 
-  const data = (await res.json()) as QueueResponse;
-  if (!data?.jobId) throw new Error("No jobId in response");
-  return data;
+  // You can map server fields → client shape here if needed.
+  return json as AnalysisResult;
 }
-
-// -------- Public API ----------
-export const Api = {
-  /**
-   * Queue an analysis job.
-   * If EXPO_PUBLIC_API_URL is set (Render, etc.), it will POST there.
-   * Otherwise it returns a local mock job so the app can be demoed offline.
-   */
-  async analyze(payload: AnalyzeRequest): Promise<QueueResponse> {
-    if (BASE_URL) {
-      // Live backend path (adjust if your FastAPI route differs)
-      return uploadMultipart(`${BASE_URL}/analyze`, payload);
-    }
-    // Fallback: local mock job
-    return { jobId: "mock-1" };
-  },
-
-  /**
-   * Poll a job by id.
-   * If we’re using the live backend, call /jobs/:id.
-   * Otherwise, instantly return a mock "done" job with a sample report.
-   */
-  async getJob(jobId: string): Promise<JobResponse> {
-    if (BASE_URL && !jobId.startsWith("mock")) {
-      const res = await fetch(`${BASE_URL}/jobs/${encodeURIComponent(jobId)}`);
-      if (!res.ok) {
-        const text = await res.text().catch(() => "");
-        throw new Error(`Job fetch failed (${res.status}): ${text}`);
-      }
-      return (await res.json()) as JobResponse;
-    }
-
-    // Mock report (shape it to what your Results screen expects)
-    return {
-      status: "done",
-      report: {
-        date: new Date().toISOString(),
-        score: 85,
-        upperBody: 88,
-        lowerBody: 82,
-        symmetry: 91,
-        confidence: 94,
-        natty: true,
-        breakdown: [
-          { name: "Shoulders", tag: "balanced", value: 92 },
-          { name: "Chest", tag: "strong", value: 88 },
-          { name: "Lats", tag: "lagging", value: 65 },
-          { name: "Traps", tag: "balanced", value: 78 },
-          { name: "Quads", tag: "balanced", value: 85 },
-          { name: "Hamstrings", tag: "lagging", value: 68 },
-          { name: "Glutes", tag: "strong", value: 90 },
-          { name: "Calves", tag: "balanced", value: 75 },
-        ],
-      },
-    };
-  },
-};
-
-export type ApiType = typeof Api;

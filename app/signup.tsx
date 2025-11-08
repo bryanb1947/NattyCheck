@@ -1,3 +1,4 @@
+// app/signup.tsx
 import React, { useState } from "react";
 import {
   SafeAreaView,
@@ -8,18 +9,42 @@ import {
   TouchableOpacity,
   KeyboardAvoidingView,
   Platform,
+  Alert,
 } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import { router } from "expo-router";
+
+// If you later wire real auth, import and call your API here:
+// import { signUp } from "../lib/api";
+// import { useAuthStore } from "../store/useAuthStore";
 
 export default function SignUp() {
   const [username, setUsername] = useState("");
   const [email, setEmail] = useState("");
   const [pw, setPw] = useState("");
+  const [loading, setLoading] = useState(false);
 
-  const onCreate = () => {
-    // Mock only: real auth comes later
-    router.replace("/capture-guide");
+  const onCreate = async () => {
+    if (!username.trim() || !email.trim() || !pw.trim()) {
+      return Alert.alert("Missing info", "Please fill in username, email, and password.");
+    }
+
+    try {
+      setLoading(true);
+
+      // --- MOCK AUTH (replace with your real call when ready) ---
+      // const res = await signUp({ email, password: pw });
+      // if (!res.ok) throw new Error(res.error || "Signup failed");
+      // Optionally persist to store here:
+      // useAuthStore.getState().setUser({ id: res.data!.id, email, username });
+
+      // ✅ Go straight to camera (front first)
+      router.replace("/capture?view=front");
+    } catch (err: any) {
+      Alert.alert("Sign up failed", err?.message ?? "Please try again.");
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -66,14 +91,22 @@ export default function SignUp() {
             />
           </View>
 
-          {/* Create account */}
-          <TouchableOpacity activeOpacity={0.9} onPress={onCreate} style={{ width: "100%", marginTop: 10 }}>
-            <LinearGradient colors={["#00FFE0", "#B8FF47"]} start={{ x: 0, y: 0.5 }} end={{ x: 1, y: 0.5 }} style={styles.cta}>
-              <Text style={styles.ctaText}>Create Account</Text>
+          <TouchableOpacity
+            activeOpacity={0.9}
+            onPress={onCreate}
+            disabled={loading}
+            style={{ width: "100%", marginTop: 10 }}
+          >
+            <LinearGradient
+              colors={["#00FFE0", "#B8FF47"]}
+              start={{ x: 0, y: 0.5 }}
+              end={{ x: 1, y: 0.5 }}
+              style={[styles.cta, loading && { opacity: 0.6 }]}
+            >
+              <Text style={styles.ctaText}>{loading ? "Creating..." : "Create Account"}</Text>
             </LinearGradient>
           </TouchableOpacity>
 
-          {/* Login link */}
           <TouchableOpacity onPress={() => router.replace("/login")} style={{ marginTop: 14 }}>
             <Text style={styles.linkText}>Already have an account? Log in</Text>
           </TouchableOpacity>
