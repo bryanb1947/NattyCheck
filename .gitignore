@@ -1,15 +1,49 @@
-# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+# ============================================================
+# IGNORE FRONTEND (React Native app)
+# ============================================================
+app/
+App.tsx
+app.json
+app.config.js
+package.json
+package-lock.json
+lib/
+store/
+assets/
+expo-env.d.ts
 
-# dependencies
+# ============================================================
+# IGNORE BACKEND VENV + BUILD ARTIFACTS
+# ============================================================
+nattycheck-backend/venv/
+nattycheck-backend/__pycache__/
+nattycheck-backend/**/*.pyc
+
+# ============================================================
+# NODE & EXPO STANDARD IGNORE
+# ============================================================
 node_modules/
-
-# Expo
 .expo/
 dist/
 web-build/
-expo-env.d.ts
+.expo-shared/
 
-# Native
+# ============================================================
+# OS / SYSTEM / MISC
+# ============================================================
+.DS_Store
+.env
+.env*.local
+*.pem
+*.tsbuildinfo
+.yarn/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ============================================================
+# NATIVE & METRO
+# ============================================================
 .kotlin/
 *.orig.*
 *.jks
@@ -17,29 +51,4 @@ expo-env.d.ts
 *.p12
 *.key
 *.mobileprovision
-
-# Metro
 .metro-health-check*
-
-# debug
-npm-debug.*
-yarn-debug.*
-yarn-error.*
-
-# macOS
-.DS_Store
-*.pem
-
-# local env files
-.env*.local
-
-# typescript
-*.tsbuildinfo
-
-app-example
-
-# generated native folders
-/ios
-/android
-.env
-natty-api/.env

@@ -1,5 +1,0 @@
-// app/index.tsx — REPLACE ENTIRE FILE
-import { Redirect } from "expo-router";
-export default function Index() {
-  return <Redirect href="/onboarding" />;
-}
