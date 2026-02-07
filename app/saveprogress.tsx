@@ -15,6 +15,7 @@ import { LinearGradient } from "expo-linear-gradient";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import * as Linking from "expo-linking";
 import * as AppleAuthentication from "expo-apple-authentication";
+import * as Crypto from "expo-crypto";
 
 import { supabase } from "@/lib/supabase";
 import { useAuthStore } from "@/store/useAuthStore";
@@ -85,8 +86,11 @@ async function withTimeout<T>(p: Promise<T>, ms = 12000, label = "Request") {
   });
 }
 
-// Simple nonce generator. (Good enough for most apps.)
-// If you want stronger nonce later we can switch to expo-crypto.
+/**
+ * Nonce generator
+ * - We will send SHA256(nonce) to Apple
+ * - We will send the raw nonce to Supabase
+ */
 function makeNonce() {
   return `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random()
     .toString(36)
@@ -103,7 +107,9 @@ export default function SaveProgress() {
   );
 
   const userId = useAuthStore((s) => s.userId);
-  const setDidPromptSaveProgress = useAuthStore((s) => s.setDidPromptSaveProgress);
+  const setDidPromptSaveProgress = useAuthStore(
+    (s) => s.setDidPromptSaveProgress
+  );
   const ensureGuestSession = useAuthStore((s) => s.ensureGuestSession);
   const bootstrapAuth = useAuthStore((s) => s.bootstrapAuth);
 
@@ -233,7 +239,9 @@ export default function SaveProgress() {
 
   /**
    * ✅ Native Apple Sign-In (NO browser)
-   * Uses expo-apple-authentication → identityToken → Supabase signInWithIdToken
+   * IMPORTANT:
+   * - Apple should receive SHA256(nonce)
+   * - Supabase should receive raw nonce
    */
   const startAppleNative = useCallback(async () => {
     if (busy) return;
@@ -255,14 +263,18 @@ export default function SaveProgress() {
         throw new Error("Sign in with Apple is not available on this device.");
       }
 
-      const nonce = makeNonce();
+      const rawNonce = makeNonce();
+      const hashedNonce = await Crypto.digestStringAsync(
+        Crypto.CryptoDigestAlgorithm.SHA256,
+        rawNonce
+      );
 
       const credential = await AppleAuthentication.signInAsync({
         requestedScopes: [
           AppleAuthentication.AppleAuthenticationScope.FULL_NAME,
           AppleAuthentication.AppleAuthenticationScope.EMAIL,
         ],
-        nonce,
+        nonce: hashedNonce, // ✅ hashed sent to Apple
       });
 
       const idToken = credential?.identityToken;
@@ -275,7 +287,7 @@ export default function SaveProgress() {
         supabase.auth.signInWithIdToken({
           provider: "apple",
           token: idToken,
-          nonce,
+          nonce: rawNonce, // ✅ raw nonce sent to Supabase
         }),
         12000,
         "signInWithIdToken"
