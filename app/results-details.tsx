@@ -1,6 +1,6 @@
 // app/results-details.tsx
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   SafeAreaView,
   ScrollView,
@@ -11,13 +11,16 @@ import {
   TouchableOpacity,
   Image,
   Dimensions,
+  Modal,
+  Pressable,
+  StatusBar,
 } from "react-native";
 import { useLocalSearchParams, Stack, useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { supabase } from "../lib/supabase";
 import { getPhotoHistory } from "@/lib/photoHistory";
 
-const { width } = Dimensions.get("window");
+const { width, height } = Dimensions.get("window");
 
 const colors = {
   bg: "#0B0F0F",
@@ -34,6 +37,11 @@ type PhotoHistoryEntry = {
   backUri?: string;
 };
 
+type Slide = {
+  key: keyof PhotoHistoryEntry;
+  label: string;
+};
+
 export default function ResultsDetails() {
   const router = useRouter();
   const { id } = useLocalSearchParams();
@@ -43,6 +51,23 @@ export default function ResultsDetails() {
 
   const [photos, setPhotos] = useState<PhotoHistoryEntry | null>(null);
   const [photosLoading, setPhotosLoading] = useState(true);
+
+  // Fullscreen viewer state
+  const [viewerOpen, setViewerOpen] = useState(false);
+  const [viewerUri, setViewerUri] = useState<string | null>(null);
+  const [viewerLabel, setViewerLabel] = useState<string>("");
+
+  const slides: Slide[] = useMemo(
+    () => [
+      { key: "frontUri", label: "Front" },
+      { key: "sideUri", label: "Side" },
+      { key: "backUri", label: "Back" },
+    ],
+    []
+  );
+
+  const hasAnyPhotos =
+    !!photos && (!!photos.frontUri || !!photos.sideUri || !!photos.backUri);
 
   /* ---------------------------------------
      Load report from Supabase
@@ -78,9 +103,7 @@ export default function ResultsDetails() {
     const loadPhotos = async () => {
       try {
         const entry = await getPhotoHistory(String(id));
-        if (entry) {
-          setPhotos(entry);
-        }
+        if (entry) setPhotos(entry);
       } catch (err) {
         console.log("Failed to load photo history for report:", id, err);
       } finally {
@@ -90,6 +113,21 @@ export default function ResultsDetails() {
 
     loadPhotos();
   }, [id]);
+
+  const openViewer = (uri: string, label: string) => {
+    setViewerUri(uri);
+    setViewerLabel(label);
+    setViewerOpen(true);
+  };
+
+  const closeViewer = () => {
+    setViewerOpen(false);
+    // slight delay so close animation feels clean (optional)
+    setTimeout(() => {
+      setViewerUri(null);
+      setViewerLabel("");
+    }, 120);
+  };
 
   if (loading) {
     return (
@@ -111,30 +149,12 @@ export default function ResultsDetails() {
     );
   }
 
-  const {
-    score,
-    natty,
-    bodyfat,
-    symmetry,
-    confidence,
-    muscles,
-    created_at,
-    type,
-  } = report;
-
-  const slides = [
-    { key: "frontUri" as const, label: "Front" },
-    { key: "sideUri" as const, label: "Side" },
-    { key: "backUri" as const, label: "Back" },
-  ];
-
-  const hasAnyPhotos =
-    photos &&
-    (photos.frontUri || photos.sideUri || photos.backUri);
+  const { score, natty, bodyfat, symmetry, confidence, muscles, created_at, type } =
+    report;
 
   return (
     <>
-      {/* ✅ Custom Header WITH Back Button + Swipe Gesture Allowed */}
+      {/* ✅ Header */}
       <Stack.Screen
         options={{
           headerShown: true,
@@ -152,6 +172,46 @@ export default function ResultsDetails() {
         }}
       />
 
+      {/* Fullscreen Photo Viewer */}
+      <Modal
+        visible={viewerOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={closeViewer}
+      >
+        <StatusBar barStyle="light-content" />
+        <Pressable style={styles.modalBackdrop} onPress={closeViewer}>
+          <Pressable
+            style={styles.modalCard}
+            onPress={() => {
+              // Prevent closing when tapping the image container
+            }}
+          >
+            <View style={styles.modalTopBar}>
+              <View style={styles.modalPill}>
+                <Text style={styles.modalPillText}>{viewerLabel}</Text>
+              </View>
+
+              <TouchableOpacity onPress={closeViewer} style={styles.modalCloseBtn}>
+                <Ionicons name="close" size={22} color="#EAF4F1" />
+              </TouchableOpacity>
+            </View>
+
+            <View style={styles.modalImageWrap}>
+              {viewerUri ? (
+                <Image
+                  source={{ uri: viewerUri }}
+                  style={styles.modalImage}
+                  resizeMode="contain"
+                />
+              ) : null}
+            </View>
+
+            <Text style={styles.modalHint}>Tap outside to close</Text>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
       <SafeAreaView style={styles.safe}>
         <ScrollView contentContainerStyle={styles.content}>
           {/* HEADER */}
@@ -164,7 +224,7 @@ export default function ResultsDetails() {
             })}
           </Text>
 
-          {/* CAPTURED PHOTOS CAROUSEL (LOCAL-ONLY) */}
+          {/* CAPTURED PHOTOS CAROUSEL */}
           {!photosLoading && hasAnyPhotos && (
             <View style={styles.card}>
               <Text style={[styles.label, { marginBottom: 10 }]}>
@@ -182,25 +242,30 @@ export default function ResultsDetails() {
                   if (!uri) return null;
 
                   return (
-                    <View key={slide.key} style={styles.photoSlide}>
-                      <Image
-                        source={{ uri }}
-                        style={styles.photoImage}
-                        resizeMode="cover"
-                      />
+                    <TouchableOpacity
+                      key={slide.key}
+                      activeOpacity={0.9}
+                      onPress={() => openViewer(uri, slide.label)}
+                      style={styles.photoSlide}
+                    >
+                      <Image source={{ uri }} style={styles.photoImage} resizeMode="cover" />
+
+                      {/* label */}
                       <View style={styles.photoLabelBadge}>
-                        <Text style={styles.photoLabelText}>
-                          {slide.label}
-                        </Text>
+                        <Text style={styles.photoLabelText}>{slide.label}</Text>
                       </View>
-                    </View>
+
+                      {/* subtle “tap to expand” icon */}
+                      <View style={styles.expandBadge}>
+                        <Ionicons name="expand-outline" size={16} color="#EAF4F1" />
+                      </View>
+                    </TouchableOpacity>
                   );
                 })}
               </ScrollView>
 
               <Text style={styles.photoPrivacyNote}>
-                These images are stored securely on your device only and are
-                never uploaded to our servers.
+                Stored securely on your device only — never uploaded.
               </Text>
             </View>
           )}
@@ -225,38 +290,47 @@ export default function ResultsDetails() {
 
               <View style={styles.statBlock}>
                 <Text style={styles.label}>Body Fat</Text>
-                <Text style={styles.valueSmall}>{bodyfat}%</Text>
+                <Text style={styles.valueSmall}>
+                  {typeof bodyfat === "number" ? `${bodyfat}%` : "—"}
+                </Text>
               </View>
 
               <View style={styles.statBlock}>
                 <Text style={styles.label}>Confidence</Text>
-                <Text style={styles.valueSmall}>{confidence}%</Text>
+                <Text style={styles.valueSmall}>
+                  {typeof confidence === "number" ? `${confidence}%` : "—"}
+                </Text>
               </View>
             </View>
 
             <Text style={[styles.label, { marginTop: 12 }]}>Type</Text>
-            <Text style={styles.valueSmall}>{type}</Text>
+            <Text style={styles.valueSmall}>{type ?? "—"}</Text>
           </View>
 
           {/* MUSCLE BREAKDOWN */}
           <View style={styles.card}>
             <Text style={styles.label}>Muscle Breakdown</Text>
 
-            {muscles &&
+            {muscles ? (
               Object.entries(muscles).map(([muscle, val]: any) => (
                 <View key={muscle} style={styles.muscleRow}>
-                  <Text style={styles.muscleLabel}>
-                    {muscle.toUpperCase()}
+                  <Text style={styles.muscleLabel}>{String(muscle).toUpperCase()}</Text>
+                  <Text style={styles.muscleVal}>
+                    {typeof val === "number" ? `${val}%` : "—"}
                   </Text>
-                  <Text style={styles.muscleVal}>{val}%</Text>
                 </View>
-              ))}
+              ))
+            ) : (
+              <Text style={[styles.dim, { marginTop: 10 }]}>No muscle data saved.</Text>
+            )}
           </View>
 
           {/* SYMMETRY */}
           <View style={styles.card}>
             <Text style={styles.label}>Symmetry</Text>
-            <Text style={styles.valueSmall}>{symmetry}%</Text>
+            <Text style={styles.valueSmall}>
+              {typeof symmetry === "number" ? `${symmetry}%` : "—"}
+            </Text>
           </View>
 
           <View style={{ height: 40 }} />
@@ -298,6 +372,7 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     justifyContent: "space-between",
     marginTop: 14,
+    gap: 12,
   },
   statBlock: { flex: 1 },
 
@@ -322,6 +397,8 @@ const styles = StyleSheet.create({
     overflow: "hidden",
     marginRight: 12,
     backgroundColor: "#050505",
+    borderWidth: 1,
+    borderColor: "#1C2627",
   },
   photoImage: {
     width: "100%",
@@ -341,9 +418,90 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: "700",
   },
+  expandBadge: {
+    position: "absolute",
+    top: 12,
+    right: 12,
+    width: 34,
+    height: 34,
+    borderRadius: 10,
+    backgroundColor: "rgba(0,0,0,0.55)",
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.12)",
+  },
   photoPrivacyNote: {
     color: colors.dim,
     fontSize: 11,
     marginTop: 10,
+  },
+
+  /* Modal */
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.75)",
+    justifyContent: "center",
+    alignItems: "center",
+    paddingHorizontal: 14,
+  },
+  modalCard: {
+    width: "100%",
+    maxWidth: 520,
+    backgroundColor: "#0A0E0F",
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.10)",
+    overflow: "hidden",
+  },
+  modalTopBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 12,
+    paddingTop: 12,
+    paddingBottom: 10,
+  },
+  modalPill: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 999,
+    backgroundColor: "rgba(184,255,71,0.12)",
+    borderWidth: 1,
+    borderColor: "rgba(184,255,71,0.25)",
+  },
+  modalPillText: {
+    color: colors.accent,
+    fontWeight: "800",
+    fontSize: 12,
+  },
+  modalCloseBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 12,
+    backgroundColor: "rgba(255,255,255,0.06)",
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.10)",
+  },
+  modalImageWrap: {
+    width: "100%",
+    height: Math.min(height * 0.72, 640),
+    backgroundColor: "#060909",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 10,
+    paddingBottom: 6,
+  },
+  modalImage: {
+    width: "100%",
+    height: "100%",
+  },
+  modalHint: {
+    color: "rgba(255,255,255,0.45)",
+    fontSize: 11,
+    textAlign: "center",
+    paddingVertical: 10,
   },
 });

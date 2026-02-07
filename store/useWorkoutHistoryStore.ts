@@ -1,16 +1,22 @@
 // store/useWorkoutHistoryStore.ts
+// -------------------------------------------------------
+// WORKOUT HISTORY STORE (LOCAL ONLY)
+// ✅ Single source of truth for cloud logging is workout-session/[sessionId].tsx
+// ✅ This store is ONLY for local UX (recent sessions, offline cache, etc.)
+// ✅ Removes ALL Supabase writes to prevent double-inserts + schema mismatch errors
+// ✅ No duration_minutes anywhere
+// -------------------------------------------------------
+
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { supabase } from "@/lib/supabase";
-import { useAuthStore } from "./useAuthStore";
 
 /* -------------------------------------------------------
    TYPES
 ------------------------------------------------------- */
 export type LoggedSet = {
   target: number | string;
-  actual?: number;
+  actual?: number | null;
 };
 
 export type LoggedExercise = {
@@ -18,154 +24,205 @@ export type LoggedExercise = {
   name: string;
   muscle: string;
   sets: LoggedSet[];
+  // optional (nice to keep for reporting/grouping)
+  day_id?: string;
+  day_name?: string;
 };
 
 export type WorkoutSession = {
-  id: string; // UUID for local
-  date: string;
+  session_id: string;
+  date: string; // ISO string (timestamp)
+
   workoutType: "ai" | "custom";
   workoutId?: string;
+
+  // ✅ MUST exist (fallback to "Workout")
+  workoutName: string;
+
   dayId?: string;
   dayName?: string;
+
   exercises: LoggedExercise[];
-  durationMinutes?: number;
+
+  totals?: {
+    total_sets: number;
+    completed_sets: number;
+    completed_reps: number;
+  };
 };
 
 type WorkoutHistoryState = {
   sessions: WorkoutSession[];
 
-  logSession: (session: Omit<WorkoutSession, "id" | "date">) => Promise<WorkoutSession>;
-  updateSession: (sessionId: string, partial: Partial<WorkoutSession>) => Promise<void>;
-  deleteSession: (sessionId: string) => Promise<void>;
+  // LOCAL ONLY (no Supabase)
+  logSession: (session: Omit<WorkoutSession, "session_id" | "date">) => Promise<WorkoutSession>;
+  updateSession: (session_id: string, partial: Partial<WorkoutSession>) => Promise<void>;
+  deleteSession: (session_id: string) => Promise<void>;
 
   getSessionsForMonth: (year: number, month: number) => WorkoutSession[];
+  clearAll: () => void;
 };
 
 /* -------------------------------------------------------
-   LOCAL ID HELPER
+   UUID HELPER (NO DEPS)
 ------------------------------------------------------- */
-function makeId(prefix = "sess"): string {
-  return `${prefix}_${Math.random().toString(36).slice(2)}_${Date.now()}`;
+function uuidv4Fallback() {
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
+function makeUuid(): string {
+  const c = (globalThis as any)?.crypto;
+  if (c?.randomUUID) return c.randomUUID();
+  return uuidv4Fallback();
+}
+
+function nonEmptyString(v: any, fallback: string) {
+  const s = typeof v === "string" ? v.trim() : "";
+  return s.length ? s : fallback;
+}
+
+function safeIso(iso?: any) {
+  const d = iso ? new Date(iso) : new Date();
+  return isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
 }
 
 /* -------------------------------------------------------
-   STORE
+   DERIVED TOTALS (if caller doesn't provide)
+------------------------------------------------------- */
+function computeTotals(exercises: LoggedExercise[]) {
+  let total_sets = 0;
+  let completed_sets = 0;
+  let completed_reps = 0;
+
+  for (const ex of exercises || []) {
+    const sets = Array.isArray(ex.sets) ? ex.sets : [];
+    total_sets += sets.length;
+
+    for (const s of sets) {
+      const actual = typeof s?.actual === "number" ? s.actual : null;
+      if (actual != null) {
+        completed_sets += 1;
+        completed_reps += actual;
+      }
+    }
+  }
+
+  return { total_sets, completed_sets, completed_reps };
+}
+
+/* -------------------------------------------------------
+   STORE (LOCAL ONLY)
 ------------------------------------------------------- */
 export const useWorkoutHistoryStore = create<WorkoutHistoryState>()(
   persist(
     (set, get) => ({
       sessions: [],
 
-      /* -------------------------------------------------------
-         LOG NEW SESSION (LOCAL + SUPABASE)
-      ------------------------------------------------------- */
+      // ------------------------------------------------------
+      // LOG NEW SESSION (LOCAL ONLY)
+      // ------------------------------------------------------
       logSession: async (session) => {
-        const userId = useAuthStore.getState().userId;
-        if (!userId) throw new Error("Cannot log workout — user not logged in.");
+        const safeWorkoutName = nonEmptyString((session as any)?.workoutName, "Workout");
+
+        const date = safeIso((session as any)?.date);
+        const exercises = Array.isArray((session as any)?.exercises) ? (session as any).exercises : [];
+
+        const totals =
+          (session as any)?.totals &&
+          typeof (session as any).totals.total_sets === "number" &&
+          typeof (session as any).totals.completed_sets === "number" &&
+          typeof (session as any).totals.completed_reps === "number"
+            ? (session as any).totals
+            : computeTotals(exercises);
 
         const newSession: WorkoutSession = {
-          id: makeId("session"),
-          date: new Date().toISOString(),
+          session_id: makeUuid(),
+          date,
           ...session,
+          workoutName: safeWorkoutName,
+          exercises,
+          totals,
         };
 
-        // 1. Save to local state immediately
         set((state) => ({
-          sessions: [...state.sessions, newSession],
+          sessions: [newSession, ...state.sessions],
         }));
-
-        // 2. Save to Supabase
-        const { error } = await supabase
-          .from("workout_sessions")
-          .insert({
-            id: newSession.id,
-            user_id: userId,
-            date: newSession.date,
-            workout_type: newSession.workoutType,
-            workout_id: newSession.workoutId ?? null,
-            day_id: newSession.dayId ?? null,
-            day_name: newSession.dayName ?? null,
-            exercises: newSession.exercises,
-            duration_minutes: newSession.durationMinutes ?? null,
-          });
-
-        if (error) {
-          console.warn("❗Failed to sync workout to Supabase:", error);
-        }
 
         return newSession;
       },
 
-      /* -------------------------------------------------------
-         UPDATE SESSION
-      ------------------------------------------------------- */
-      updateSession: async (sessionId, partial) => {
-        const session = get().sessions.find((s) => s.id === sessionId);
-        if (!session) return;
+      // ------------------------------------------------------
+      // UPDATE SESSION (LOCAL ONLY)
+      // ------------------------------------------------------
+      updateSession: async (session_id, partial) => {
+        const current = get().sessions.find((s) => s.session_id === session_id);
+        if (!current) return;
 
-        const updated = { ...session, ...partial };
+        const nextWorkoutName = nonEmptyString(
+          (partial as any)?.workoutName ?? current.workoutName,
+          "Workout"
+        );
 
-        // 1. LOCAL update
+        const nextExercises = Array.isArray((partial as any)?.exercises)
+          ? (partial as any).exercises
+          : current.exercises;
+
+        const nextDate = partial.date ? safeIso(partial.date) : current.date;
+
+        const nextTotals =
+          (partial as any)?.totals &&
+          typeof (partial as any).totals.total_sets === "number" &&
+          typeof (partial as any).totals.completed_sets === "number" &&
+          typeof (partial as any).totals.completed_reps === "number"
+            ? (partial as any).totals
+            : computeTotals(nextExercises);
+
+        const updated: WorkoutSession = {
+          ...current,
+          ...partial,
+          date: nextDate,
+          workoutName: nextWorkoutName,
+          exercises: nextExercises,
+          totals: nextTotals,
+        };
+
         set((state) => ({
-          sessions: state.sessions.map((s) =>
-            s.id === sessionId ? updated : s
-          ),
+          sessions: state.sessions.map((s) => (s.session_id === session_id ? updated : s)),
         }));
-
-        // 2. SUPABASE update
-        const { error } = await supabase
-          .from("workout_sessions")
-          .update({
-            date: updated.date,
-            workout_type: updated.workoutType,
-            workout_id: updated.workoutId ?? null,
-            day_id: updated.dayId ?? null,
-            day_name: updated.dayName ?? null,
-            exercises: updated.exercises,
-            duration_minutes: updated.durationMinutes ?? null,
-          })
-          .eq("id", sessionId);
-
-        if (error) {
-          console.warn("❗Failed to update workout in Supabase:", error);
-        }
       },
 
-      /* -------------------------------------------------------
-         DELETE SESSION
-      ------------------------------------------------------- */
-      deleteSession: async (sessionId) => {
-        // 1. LOCAL delete
+      // ------------------------------------------------------
+      // DELETE SESSION (LOCAL ONLY)
+      // ------------------------------------------------------
+      deleteSession: async (session_id) => {
         set((state) => ({
-          sessions: state.sessions.filter((s) => s.id !== sessionId),
+          sessions: state.sessions.filter((s) => s.session_id !== session_id),
         }));
-
-        // 2. SUPABASE delete
-        const { error } = await supabase
-          .from("workout_sessions")
-          .delete()
-          .eq("id", sessionId);
-
-        if (error) {
-          console.warn("❗Failed to delete workout from Supabase:", error);
-        }
       },
 
-      /* -------------------------------------------------------
-         FILTERING FOR MONTHLY ANALYSIS
-         month = 0–11
-      ------------------------------------------------------- */
+      // ------------------------------------------------------
+      // FILTER FOR MONTH (LOCAL ONLY)
+      // month = 0–11
+      // ------------------------------------------------------
       getSessionsForMonth: (year, month) => {
         return get().sessions.filter((s) => {
           const d = new Date(s.date);
-          return d.getFullYear() === year && d.getMonth() === month;
+          return !isNaN(d.getTime()) && d.getFullYear() === year && d.getMonth() === month;
         });
       },
-    }),
 
+      clearAll: () => set({ sessions: [] }),
+    }),
     {
-      name: "natty-workout-history-v1",
+      name: "natty-workout-history-v4",
       storage: createJSONStorage(() => AsyncStorage),
+
+      // Keep storage lean-ish
+      partialize: (state) => ({ sessions: state.sessions }),
     }
   )
 );

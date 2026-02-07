@@ -1,12 +1,11 @@
 // app/(tabs)/profile.tsx
 // ------------------------------------------------------
-// Profile Home Screen
-// - Clean UI
-// - Correct routing
+// Profile Home Screen (canonical)
 // - Loads Supabase profile
-// - Shows username, email, plan
-// - Sections: Account / Privacy & Data / Support
-// - Redirects to login if not authenticated
+// - Shows username, email, plan (FREE / PREMIUM)
+// - Uses ONLY profiles.plan_normalized
+// - Redirects to /login if not authenticated
+// - Logout uses ONLY useAuthStore.logout() (no direct supabase.signOut here)
 // ------------------------------------------------------
 
 import React, { useEffect, useState, useCallback } from "react";
@@ -26,8 +25,8 @@ import { LinearGradient } from "expo-linear-gradient";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 
-import { supabase } from "../../lib/supabase";
-import { useAuthStore } from "../../store/useAuthStore";
+import { supabase } from "@/lib/supabase";
+import { useAuthStore } from "@/store/useAuthStore";
 
 const C = {
   bg: "#0B0F10",
@@ -40,24 +39,16 @@ const C = {
   danger: "#FF4E4E",
 };
 
-type LocalPlan = "free" | "premium" | "trial";
+type CanonPlan = "free" | "pro";
 
-function normalizeToLocalPlan(raw: any): LocalPlan {
-  const v = String(raw ?? "").trim().toLowerCase();
-  if (v === "pro" || v === "premium" || v === "paid") return "premium";
-  if (v === "trial") return "trial";
-  return "free";
+function normalizePlan(v: any): CanonPlan {
+  const s = String(v ?? "").trim().toLowerCase();
+  return s === "pro" ? "pro" : "free";
 }
 
-function normalizeToAuthPlan(raw: any): "free" | "pro" {
-  const v = String(raw ?? "").trim().toLowerCase();
-  if (v === "pro" || v === "premium" || v === "paid") return "pro";
-  return "free";
+function planLabel(plan: CanonPlan) {
+  return plan === "pro" ? "Premium" : "Free";
 }
-
-/* ------------------------------------------------------ */
-/* MAIN PROFILE SCREEN */
-/* ------------------------------------------------------ */
 
 export default function ProfileScreen() {
   const router = useRouter();
@@ -65,37 +56,60 @@ export default function ProfileScreen() {
   const userId = useAuthStore((s) => s.userId);
   const email = useAuthStore((s) => s.email);
   const hasHydrated = useAuthStore((s) => s.hasHydrated);
-  const authPlan = useAuthStore((s) => s.plan);
+  const hasBootstrappedSession = useAuthStore((s) => s.hasBootstrappedSession);
 
   const setIdentity = useAuthStore((s) => s.setIdentity);
   const setPlanInStore = useAuthStore((s) => s.setPlan);
-  const logoutLocal = useAuthStore((s) => s.logout);
+  const logoutStore = useAuthStore((s) => s.logout);
 
   const [loading, setLoading] = useState(true);
   const [username, setUsername] = useState("User");
-  const [plan, setPlan] = useState<LocalPlan>("free");
+  const [plan, setPlan] = useState<CanonPlan>("free");
 
-  /* --------------------------
-     LOAD PROFILE FROM SUPABASE
-  --------------------------- */
   const loadProfile = useCallback(async () => {
-    if (!userId) return;
+    setLoading(true);
 
     try {
+      // Session is source of truth
+      const {
+        data: { session },
+        error: sessErr,
+      } = await supabase.auth.getSession();
+
+      if (sessErr) console.log("❌ getSession error:", sessErr.message);
+
+      const u = session?.user ?? null;
+      const uid = u?.id ?? null;
+      const em = u?.email ?? null;
+
+      if (!uid) {
+        // Not authenticated -> go login
+        setUsername("User");
+        setPlan("free");
+        setPlanInStore("free");
+        router.replace("/login");
+        return;
+      }
+
+      // Keep auth store aligned (even if store was stale)
+      setIdentity({ userId: uid, email: em ?? null });
+
       const { data, error } = await supabase
         .from("profiles")
-        .select("*")
-        .eq("user_id", userId)
+        .select("user_id, email, username, plan_normalized")
+        .eq("user_id", uid)
         .maybeSingle();
 
       if (error) {
-        console.log("Profile lookup error:", error.message);
+        console.log("❌ Profile lookup error:", error.message);
+        setUsername("User");
+        setPlan("free");
+        setPlanInStore("free");
         return;
       }
 
       if (!data) {
-        // No profile row found — treat as free (but don’t crash)
-        console.log("⚠️ No profile row found for user. Treating as free.");
+        console.log("⚠️ No profile row found. Treating as FREE.");
         setUsername("User");
         setPlan("free");
         setPlanInStore("free");
@@ -104,55 +118,56 @@ export default function ProfileScreen() {
 
       setUsername(data.username ?? "User");
 
-      const localPlan = normalizeToLocalPlan(data.plan);
-      setPlan(localPlan);
+      const normalized = normalizePlan(data.plan_normalized);
+      setPlan(normalized);
+      setPlanInStore(normalized);
 
-      // Keep Zustand store updated using the NEW API
-      setPlanInStore(normalizeToAuthPlan(data.plan));
-
-      // Keep email in store consistent (optional)
-      const nextEmail = data.email ?? email;
+      const nextEmail = data.email ?? em ?? "";
       if (nextEmail && nextEmail !== email) {
-        setIdentity({ userId, email: nextEmail });
+        setIdentity({ userId: uid, email: nextEmail });
       }
-    } catch (err) {
-      console.log("Profile load exception:", err);
+    } catch (e: any) {
+      console.log("❌ Profile load exception:", e?.message ?? e);
+      setUsername("User");
+      setPlan("free");
+      setPlanInStore("free");
     } finally {
       setLoading(false);
     }
-  }, [userId, email, setIdentity, setPlanInStore]);
+  }, [router, setIdentity, setPlanInStore, email]);
 
   useEffect(() => {
-    if (!hasHydrated) return;
+    // Wait for auth bootstrap so we don't read stale session/store
+    if (!hasHydrated || !hasBootstrappedSession) return;
 
-    if (!userId) {
-      router.replace("/login");
-      return;
-    }
+    // If store says logged out, confirm session before redirect
+    // (avoids flicker on cold start)
+    (async () => {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
 
-    loadProfile();
-  }, [hasHydrated, userId, loadProfile, router]);
+      if (!session?.user?.id && !userId) {
+        router.replace("/login");
+        return;
+      }
 
-  /* --------------------------
-     LOGOUT
-  --------------------------- */
-  const logout = async () => {
+      loadProfile();
+    })();
+  }, [hasHydrated, hasBootstrappedSession, userId, loadProfile, router]);
+
+  const handleLogout = async () => {
     try {
-      await supabase.auth.signOut();
+      // ✅ Only use store logout (it calls supabase.auth.signOut internally)
+      await logoutStore();
     } catch (e) {
-      console.log("Supabase signOut error:", e);
+      console.log("Logout error:", e);
+    } finally {
+      router.replace("/login");
     }
-
-    // Clear local store properly
-    logoutLocal();
-
-    router.replace("/login");
   };
 
-  /* --------------------------
-     HEADER LOADING STATE
-  --------------------------- */
-  if (!hasHydrated || loading) {
+  if (!hasHydrated || !hasBootstrappedSession || loading) {
     return (
       <SafeAreaView style={styles.safe}>
         <View style={styles.center}>
@@ -163,8 +178,7 @@ export default function ProfileScreen() {
     );
   }
 
-  const planLabel =
-    plan === "premium" ? "Premium" : plan === "trial" ? "Free Trial" : "Free";
+  const label = planLabel(plan);
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -176,8 +190,8 @@ export default function ProfileScreen() {
         {/* TOP PROFILE CARD */}
         <LinearGradient
           colors={["#10181C", "#0F1418"]}
-          start={[0, 0]}
-          end={[1, 1]}
+          start={{ x: 0, y: 0 }}
+          end={{ x: 1, y: 1 }}
           style={styles.headerCard}
         >
           <View style={styles.headerRow}>
@@ -191,14 +205,7 @@ export default function ProfileScreen() {
 
               <View style={styles.badgeRow}>
                 <View style={styles.badge}>
-                  <Text style={styles.badgeText}>{planLabel}</Text>
-                </View>
-
-                {/* Optional: show store plan (debug) */}
-                <View style={[styles.badge, { marginLeft: 8 }]}>
-                  <Text style={styles.badgeText}>
-                    Store: {authPlan === "pro" ? "Pro" : "Free"}
-                  </Text>
+                  <Text style={styles.badgeText}>{label}</Text>
                 </View>
               </View>
             </View>
@@ -227,7 +234,7 @@ export default function ProfileScreen() {
           <Row
             icon="card-outline"
             label="Subscription"
-            trailingText={planLabel}
+            trailingText={label}
             onPress={() => router.push("/profile-subscription")}
           />
         </Section>
@@ -272,7 +279,7 @@ export default function ProfileScreen() {
           onPress={() => {
             Alert.alert("Log Out", "Are you sure?", [
               { text: "Cancel", style: "cancel" },
-              { text: "Log Out", style: "destructive", onPress: logout },
+              { text: "Log Out", style: "destructive", onPress: handleLogout },
             ]);
           }}
         >
@@ -293,13 +300,7 @@ export default function ProfileScreen() {
 /* COMPONENTS */
 /* ------------------------------------------------------ */
 
-function Section({
-  title,
-  children,
-}: {
-  title: string;
-  children: React.ReactNode;
-}) {
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <View style={styles.section}>
       <Text style={styles.sectionTitle}>{title}</Text>
@@ -339,7 +340,7 @@ function ToggleRow({ label }: { label: string }) {
   const [value, setValue] = useState(false);
 
   return (
-    <View style={styles.row}>
+    <View style={[styles.row, { borderBottomWidth: 0 }]}>
       <Text style={styles.rowText}>{label}</Text>
       <Switch
         value={value}

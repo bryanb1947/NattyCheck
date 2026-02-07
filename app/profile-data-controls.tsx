@@ -1,7 +1,11 @@
 // app/profile-data-controls.tsx
 // ------------------------------------------------------
-// Data & Account Controls (FINAL FIXED VERSION)
-// Correct backend routes: /account/delete-data + /account/delete
+// Data & Account Controls
+// - Delete cloud data: DELETE /account/delete-data
+// - Delete account:     DELETE /account/delete
+//
+// IMPORTANT:
+// Uses Supabase JWT via lib/api (NOT userId in Authorization header).
 // ------------------------------------------------------
 
 import React, { useState } from "react";
@@ -21,6 +25,9 @@ import { Stack, useRouter } from "expo-router";
 import { supabase } from "@/lib/supabase";
 import { useAuthStore } from "@/store/useAuthStore";
 
+// ✅ Use centralized account API helpers (JWT authed + fallback-safe)
+import { deleteAccount, deleteAllData } from "@/lib/api/account";
+
 const C = {
   bg: "#050707",
   card: "#101417",
@@ -31,12 +38,6 @@ const C = {
   dangerSoft: "#FFB3B3",
   accentSoft: "#00F5A0",
 };
-
-// Remove trailing slash
-const API_BASE = (
-  process.env.EXPO_PUBLIC_API_URL ??
-  "https://nattycheck-backend-production.up.railway.app"
-).replace(/\/$/, "");
 
 export default function ProfileDataControlsScreen() {
   const router = useRouter();
@@ -75,30 +76,6 @@ export default function ProfileDataControlsScreen() {
   }
 
   // -----------------------------------------------
-  // Backend DELETE helper
-  // -----------------------------------------------
-  async function sendDelete(path: string) {
-    const url = `${API_BASE}${path}`;
-    console.log("🔥 DELETE", url);
-
-    const res = await fetch(url, {
-      method: "DELETE",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${userId}`,
-      },
-    });
-
-    const json = await res.json().catch(() => null);
-
-    if (!res.ok) {
-      throw new Error(json?.detail || "Request failed");
-    }
-
-    return json;
-  }
-
-  // -----------------------------------------------
   // DELETE DATA (Cloud only)
   // -----------------------------------------------
   const handleDeleteData = () => {
@@ -113,10 +90,16 @@ export default function ProfileDataControlsScreen() {
           onPress: async () => {
             try {
               setDeletingData(true);
-              await sendDelete("/account/delete-data");
+
+              const resp = await deleteAllData();
+              if (!resp.success) {
+                Alert.alert("Error", resp.message || "Unable to delete data.");
+                return;
+              }
+
               Alert.alert("Data Deleted", "Cloud data successfully wiped.");
             } catch (err: any) {
-              Alert.alert("Error", err.message || "Unable to delete data.");
+              Alert.alert("Error", err?.message || "Unable to delete data.");
             } finally {
               setDeletingData(false);
             }
@@ -142,10 +125,13 @@ export default function ProfileDataControlsScreen() {
             try {
               setDeletingAccount(true);
 
-              // Call backend
-              await sendDelete("/account/delete");
+              const resp = await deleteAccount();
+              if (!resp.success) {
+                Alert.alert("Error", resp.message || "Unable to delete account.");
+                return;
+              }
 
-              // Log out
+              // Log out locally
               await supabase.auth.signOut().catch(() => {});
 
               setUser({
@@ -156,7 +142,7 @@ export default function ProfileDataControlsScreen() {
 
               router.replace("/login");
             } catch (err: any) {
-              Alert.alert("Error", err.message || "Unable to delete account.");
+              Alert.alert("Error", err?.message || "Unable to delete account.");
             } finally {
               setDeletingAccount(false);
             }

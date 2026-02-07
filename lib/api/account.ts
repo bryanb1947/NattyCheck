@@ -1,48 +1,63 @@
 // lib/api/account.ts
 // ------------------------------------------------------
-// Frontend API helpers for:
+// Frontend API helpers for account actions (authenticated)
 // - Delete all cloud data
 // - Delete entire account (auth + all data)
 // ------------------------------------------------------
-
+//
+// IMPORTANT:
+// These endpoints must be called with Supabase JWT (access_token),
+// NOT a userId. We use authedDelete() which injects the JWT.
+//
+// Also supports primary → fallback retry on 404 to survive
+// Railway "double prefix" deploys (rare but we've seen it).
 // ------------------------------------------------------
-// FIXED: Correct backend prefix is /account
-// ------------------------------------------------------
-const RAW_BASE =
-  process.env.EXPO_PUBLIC_API_URL ??
-  "https://nattycheck-backend-production.up.railway.app";
 
-const API_BASE = RAW_BASE.replace(/\/$/, "") + "/account";
+import { authedDelete } from "@/lib/api";
+
+type AccountDeleteResponse = {
+  message?: string;
+  wipe_errors?: any[];
+  detail?: string; // FastAPI errors
+  error?: string;
+  [k: string]: any;
+};
+
+function pickMessage(obj: any, fallback: string) {
+  return (
+    obj?.message ||
+    obj?.detail ||
+    obj?.error ||
+    fallback
+  );
+}
 
 // ------------------------------------------------------
 // DELETE: /account/delete-data
 // ------------------------------------------------------
-export async function deleteAllData(userId: string) {
+export async function deleteAllData() {
   try {
-    const res = await fetch(`${API_BASE}/delete-data`, {
-      method: "DELETE",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${userId}`,
-      },
+    const res = await authedDelete({
+      primary: "/account/delete-data",
+      fallback: "/account/account/delete-data",
     });
 
-    const json = await res.json().catch(() => null);
+    const data = (res.data || {}) as AccountDeleteResponse;
 
     if (!res.ok) {
       return {
         success: false,
-        message: json?.detail || "Failed to delete user data.",
+        message: pickMessage(data, "Failed to delete user data."),
       };
     }
 
     return {
       success: true,
-      message: json?.message,
-      wipe_errors: json?.wipe_errors || [],
+      message: pickMessage(data, "Deleted user data."),
+      wipe_errors: Array.isArray(data.wipe_errors) ? data.wipe_errors : [],
     };
-  } catch (err) {
-    console.log("❌ deleteAllData error:", err);
+  } catch (err: any) {
+    console.log("❌ deleteAllData error:", err?.message || err);
     return {
       success: false,
       message: "Network error while deleting data.",
@@ -53,32 +68,29 @@ export async function deleteAllData(userId: string) {
 // ------------------------------------------------------
 // DELETE: /account/delete
 // ------------------------------------------------------
-export async function deleteAccount(userId: string) {
+export async function deleteAccount() {
   try {
-    const res = await fetch(`${API_BASE}/delete`, {
-      method: "DELETE",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${userId}`,
-      },
+    const res = await authedDelete({
+      primary: "/account/delete",
+      fallback: "/account/account/delete",
     });
 
-    const json = await res.json().catch(() => null);
+    const data = (res.data || {}) as AccountDeleteResponse;
 
     if (!res.ok) {
       return {
         success: false,
-        message: json?.detail || "Failed to delete account.",
+        message: pickMessage(data, "Failed to delete account."),
       };
     }
 
     return {
       success: true,
-      message: json?.message,
-      wipe_errors: json?.wipe_errors || [],
+      message: pickMessage(data, "Deleted account."),
+      wipe_errors: Array.isArray(data.wipe_errors) ? data.wipe_errors : [],
     };
-  } catch (err) {
-    console.log("❌ deleteAccount error:", err);
+  } catch (err: any) {
+    console.log("❌ deleteAccount error:", err?.message || err);
     return {
       success: false,
       message: "Network error while deleting account.",

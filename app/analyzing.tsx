@@ -1,5 +1,5 @@
 // app/analyzing.tsx
-import React, { useEffect, useState, useRef } from "react";
+import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import {
   View,
   Text,
@@ -7,71 +7,89 @@ import {
   Dimensions,
   ActivityIndicator,
 } from "react-native";
-
 import { LinearGradient } from "expo-linear-gradient";
 import { useRouter } from "expo-router";
+
 import { useResultsStore } from "@/store/useResultsStore";
-
-// ⭐ LEGACY API FOR BASE64 READ
-import * as FileSystem from "expo-file-system/legacy";
-
-// ⭐ LOCAL PHOTO STORAGE
-import { savePhotoHistory } from "@/lib/photoHistory";
-
-// ⭐ CAPTURE STORE
 import { useCaptureStore } from "@/store/useCaptureStore";
-
-// ⭐ UUID GENERATOR
+import { useAuthStore } from "@/store/useAuthStore";
+import { savePhotoHistory } from "@/lib/photoHistory";
+import { postAnalyze } from "@/lib/api";
+import * as FileSystem from "expo-file-system/legacy";
 import { nanoid } from "nanoid/non-secure";
+import { supabase } from "@/lib/supabase";
 
 const { width } = Dimensions.get("window");
 
-// ✅ TEMP FIX: your deployed Railway backend is currently mounted at /analyze/analyze/*
-const BACKEND_URL =
-  "https://nattycheck-backend-production.up.railway.app/analyze/";
+// Force the progress screen to actually be seen
+const MIN_SCREEN_MS = 1600;
+const COMPLETE_PAUSE_MS = 250;
 
-function looksLikeFastApiError(json: any) {
-  return !!json && typeof json === "object" && typeof json.detail === "string";
+// Hard watchdog so we never spin forever
+const HARD_TIMEOUT_MS = 110_000;
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function normalizeBadAngle(v: any): "front" | "side" | "back" {
+  const s = String(v ?? "").toLowerCase();
+  if (s.includes("side")) return "side";
+  if (s.includes("back")) return "back";
+  return "front";
 }
 
-/**
- * "Valid analysis" heuristics:
- * - must NOT be a FastAPI {detail} error
- * - must have at least one meaningful analysis field (score OR groups OR bodyfat OR symmetry)
- */
-function looksLikeValidAnalysis(json: any) {
+function normalizeFailureReason(v: any): string {
+  const s = String(v ?? "").trim();
+  return s || "invalid_photo";
+}
+
+function normalizeFailureMessage(v: any): string {
+  const s = String(v ?? "").trim();
+  return s || "We couldn’t confidently analyze your photos. Please retake them.";
+}
+
+function isSuccessPayload(json: any): boolean {
   if (!json || typeof json !== "object") return false;
-  if (looksLikeFastApiError(json)) return false;
+  if (json.success === true) return true;
+  if (json.ok === true) return true;
 
-  const hasScore = typeof json.score === "number" || typeof json.score === "string";
-  const hasGroups = json.groups && typeof json.groups === "object";
+  const hasScore =
+    typeof json.score === "number" || typeof json.gptScore === "number";
+  const hasGroups = !!json.groups && typeof json.groups === "object";
   const hasBodyfat = json.bodyfat !== undefined && json.bodyfat !== null;
-  const hasSymmetry = json.symmetry !== undefined && json.symmetry !== null;
-
-  return hasScore || hasGroups || hasBodyfat || hasSymmetry;
+  return hasScore || (hasGroups && hasBodyfat);
 }
 
 export default function AnalyzingScreen() {
   const router = useRouter();
   const saveResult = useResultsStore((s) => s.setLast);
 
-  const hasRun = useRef(false);
-  const [progress, setProgress] = useState(0);
+  // ✅ use STORE hydration flags (reactive) instead of persist.hasHydrated()
+  const hasHydratedAuth = useAuthStore((s) => s.hasHydrated);
+  const hasBootstrappedSession = useAuthStore((s) => s.hasBootstrappedSession);
 
-  /* --------------------------------------------
-   * Fake progress animation
-   * ------------------------------------------ */
+  const hasRun = useRef(false);
+  const startedAtRef = useRef<number>(Date.now());
+
+  const [progress, setProgress] = useState(0);
+  const [isFinishing, setIsFinishing] = useState(false);
+  const [stage, setStage] = useState<
+    "preparing" | "session" | "reading" | "request" | "finishing"
+  >("preparing");
+
+  // Fake progress animation
   useEffect(() => {
     const t = setInterval(() => {
-      setProgress((p) => (p < 97 ? p + 2 : p));
-    }, 120);
-    return () => clearInterval(t);
-  }, []);
+      setProgress((p) => {
+        if (isFinishing) return p;
+        if (p >= 92) return 92;
+        return p + 2;
+      });
+    }, 110);
 
-  /* --------------------------------------------
-   * Read URI → base64
-   * ------------------------------------------ */
-  const readBase64 = async (uri?: string) => {
+    return () => clearInterval(t);
+  }, [isFinishing]);
+
+  const readBase64 = useCallback(async (uri?: string) => {
     if (!uri) return "";
     try {
       const b64 = await FileSystem.readAsStringAsync(uri, { encoding: "base64" });
@@ -80,35 +98,134 @@ export default function AnalyzingScreen() {
       console.log("❌ Base64 read error:", uri, e);
       return "";
     }
-  };
+  }, []);
 
-  function goInvalid(params: { badAngle?: string; reason: string; message: string }) {
-    router.replace({
-      pathname: "/invalidPhoto",
-      params: {
+  const goInvalid = useCallback(
+    (params: { badAngle?: string; reason: string; message: string }) => {
+      console.log("📸 INVALID PHOTO PARAMS:", {
         badAngle: params.badAngle || "front",
         reason: params.reason,
         message: params.message,
-      },
-    });
-  }
+      });
 
-  /* --------------------------------------------
-   * MAIN ANALYSIS LOGIC
-   * ------------------------------------------ */
+      router.replace({
+        pathname: "/invalidPhoto",
+        params: {
+          badAngle: params.badAngle || "front",
+          reason: params.reason,
+          message: params.message,
+        },
+      });
+    },
+    [router]
+  );
+
+  const finishAndNavigate = useCallback(
+    async (finalJson: any) => {
+      const elapsed = Date.now() - startedAtRef.current;
+      if (elapsed < MIN_SCREEN_MS) await sleep(MIN_SCREEN_MS - elapsed);
+
+      setStage("finishing");
+      setIsFinishing(true);
+
+      setProgress((p) => Math.max(p, 92));
+      for (let v = 92; v <= 100; v += 2) {
+        setProgress(v);
+        await sleep(35);
+      }
+
+      await sleep(COMPLETE_PAUSE_MS);
+
+      saveResult(finalJson);
+      router.replace("/results");
+    },
+    [router, saveResult]
+  );
+
+  const ensureSessionReady = useCallback(async () => {
+    // up to ~4s (covers “just logged in” hydration)
+    const attempts = 14;
+
+    for (let i = 0; i < attempts; i++) {
+      const { data } = await supabase.auth.getSession();
+      const session = data?.session ?? null;
+
+      if (session?.user?.id) {
+        const expiresAt = (session as any)?.expires_at;
+        const nowSec = Math.floor(Date.now() / 1000);
+        if (typeof expiresAt === "number" && expiresAt - nowSec < 30) {
+          try {
+            await supabase.auth.refreshSession();
+          } catch (e) {
+            console.log(
+              "🟨 refreshSession failed (non-fatal):",
+              (e as any)?.message ?? e
+            );
+          }
+        }
+        return session;
+      }
+
+      await sleep(300);
+    }
+
+    return null;
+  }, []);
+
+  const subtitle = useMemo(() => {
+    if (!hasHydratedAuth) return "Preparing login…";
+    if (!hasBootstrappedSession) return "Restoring session…";
+    if (stage === "session") return "Preparing secure session…";
+    if (stage === "reading") return "Preparing photos…";
+    if (stage === "request") return "Sending to AI…";
+    if (stage === "finishing") return "Finalizing…";
+    return "Combining angles and evaluating proportions…";
+  }, [hasHydratedAuth, hasBootstrappedSession, stage]);
+
   useEffect(() => {
+    // ✅ don’t run until auth store is hydrated AND bootstrap finished
+    if (!hasHydratedAuth) return;
+    if (!hasBootstrappedSession) return;
+
     const run = async () => {
       if (hasRun.current) return;
       hasRun.current = true;
+      startedAtRef.current = Date.now();
+
+      const watchdog = setTimeout(() => {
+        goInvalid({
+          badAngle: "front",
+          reason: "analysis_timeout",
+          message:
+            "Analysis is taking too long. Please try again (or check your connection).",
+        });
+      }, HARD_TIMEOUT_MS);
+
+      const clearWatchdog = () => clearTimeout(watchdog);
 
       try {
-        // 1️⃣ — Pull photo URIs from capture store
+        setStage("session");
+
+        const session = await ensureSessionReady();
+        if (!session?.user?.id) {
+          clearWatchdog();
+          goInvalid({
+            badAngle: "front",
+            reason: "not_authenticated",
+            message:
+              "You’re signed out. Please log in again and retry.",
+          });
+          return;
+        }
+
+        // Pull photo URIs
         const { front, side, back } = useCaptureStore.getState();
         const frontUri = front?.uri;
         const sideUri = side?.uri;
         const backUri = back?.uri;
 
         if (!frontUri || !sideUri || !backUri) {
+          clearWatchdog();
           goInvalid({
             badAngle: "front",
             reason: "missing_uri",
@@ -117,12 +234,16 @@ export default function AnalyzingScreen() {
           return;
         }
 
-        // 2️⃣ — Convert to base64
-        const front64 = await readBase64(frontUri);
-        const side64 = await readBase64(sideUri);
-        const back64 = await readBase64(backUri);
+        // Convert to base64
+        setStage("reading");
+        const [front64, side64, back64] = await Promise.all([
+          readBase64(frontUri),
+          readBase64(sideUri),
+          readBase64(backUri),
+        ]);
 
         if (!front64 || !side64 || !back64) {
+          clearWatchdog();
           goInvalid({
             badAngle: "front",
             reason: "missing_photo",
@@ -131,86 +252,126 @@ export default function AnalyzingScreen() {
           return;
         }
 
-        // 3️⃣ — Send to backend
-        console.log("📨 Analyze POST:", {
-          endpoint: BACKEND_URL,
+        console.log("📨 Analyze authed POST:", {
+          uid: session.user.id,
           frontLen: front64.length,
           sideLen: side64.length,
           backLen: back64.length,
         });
 
-        const res = await fetch(BACKEND_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            frontBase64: front64,
-            sideBase64: side64,
-            backBase64: back64,
-          }),
+        // Send to backend
+        setStage("request");
+        let res = await postAnalyze({
+          frontBase64: front64,
+          sideBase64: side64,
+          backBase64: back64,
         });
 
-        const raw = await res.text();
-
-        let json: any = null;
-        try {
-          json = JSON.parse(raw);
-        } catch {
-          console.log("❌ Backend returned non-JSON:", raw?.slice(0, 300));
-          goInvalid({
-            badAngle: "front",
-            reason: "parse_error",
-            message: "Bad response from server. Please try again.",
-          });
-          return;
-        }
-
-        // 🔎 Debug visibility (keep for now; remove later)
         console.log("🧾 Analyze response:", {
           ok: res.ok,
           status: res.status,
-          keys: json && typeof json === "object" ? Object.keys(json) : [],
-          sample: json,
+          endpointUsed: res.endpointUsed,
+          keys:
+            res.data && typeof res.data === "object" ? Object.keys(res.data) : [],
+          rawPreview: (res.raw || "").slice(0, 120),
         });
 
-        // 3a) Hard fail if HTTP is not OK
-        if (!res.ok) {
-          const msg =
-            (looksLikeFastApiError(json) && json.detail) ||
-            json?.message ||
-            "Server rejected the request. Please try again.";
-          goInvalid({
-            badAngle: json?.badAngle || "front",
-            reason: "server_error",
-            message: msg,
+        // If 401, refresh once and retry once
+        if (res.status === 401) {
+          try {
+            await supabase.auth.refreshSession();
+          } catch {}
+
+          const retry = await postAnalyze({
+            frontBase64: front64,
+            sideBase64: side64,
+            backBase64: back64,
           });
-          return;
+
+          console.log("🧾 Analyze retry:", {
+            ok: retry.ok,
+            status: retry.status,
+            endpointUsed: retry.endpointUsed,
+          });
+
+          res = retry;
+
+          if (res.status === 401) {
+            clearWatchdog();
+            goInvalid({
+              badAngle: "front",
+              reason: "not_authenticated",
+              message: "Your session expired. Please log in again.",
+            });
+            return;
+          }
         }
 
-        // 3b) Fail if the JSON explicitly says it failed
-        if (json?.ok === false || json?.success === false) {
-          goInvalid({
-            badAngle: json?.badAngle || "front",
-            reason: json?.reasonCode || "invalid_angle",
-            message:
-              json?.reason ||
-              json?.message ||
-              "Your pose, clothing, or lighting prevented accurate analysis.",
-          });
-          return;
-        }
-
-        // 3c) Fail if it looks like a FastAPI error (detail)
-        if (looksLikeFastApiError(json)) {
+        // Network / timeout from wrapper
+        if (res.status === 0) {
+          clearWatchdog();
           goInvalid({
             badAngle: "front",
-            reason: "api_detail_error",
-            message: json.detail || "Server returned an error. Please try again.",
+            reason: "network_error",
+            message: res.errorMessage || "Network error. Please try again.",
           });
           return;
         }
 
-        // 3d) Fail if it doesn't look like a real analysis payload
-        if (!looksLikeValidAnalysis(json)) {
+        if (res.status === 429) {
+          clearWatchdog();
+          goInvalid({
+            badAngle: "front",
+            reason: "rate_limited",
+            message:
+              "You’re analyzing too frequently. Please wait a moment and try again.",
+          });
+          return;
+        }
+
+        if (res.status === 413) {
+          clearWatchdog();
+          goInvalid({
+            badAngle: "front",
+            reason: "payload_too_large",
+            message:
+              "Those photos are too large for analysis. Retake them a bit farther away and try again.",
+          });
+          return;
+        }
+
+        if (!res.ok) {
+          clearWatchdog();
+          goInvalid({
+            badAngle: "front",
+            reason: "server_error",
+            message: res.errorMessage || "Server error. Please try again.",
+          });
+          return;
+        }
+
+        const json = res.data;
+
+        if (
+          json &&
+          typeof json === "object" &&
+          ((json as any).success === false || (json as any).ok === false)
+        ) {
+          clearWatchdog();
+          goInvalid({
+            badAngle: normalizeBadAngle((json as any).badAngle),
+            reason: normalizeFailureReason(
+              (json as any).reason || (json as any).reasonCode
+            ),
+            message: normalizeFailureMessage(
+              (json as any).message || (json as any).reason
+            ),
+          });
+          return;
+        }
+
+        if (!isSuccessPayload(json)) {
+          clearWatchdog();
           goInvalid({
             badAngle: "front",
             reason: "invalid_payload",
@@ -220,36 +381,45 @@ export default function AnalyzingScreen() {
           return;
         }
 
-        // 4️⃣ — Ensure ID + timestamp
-        const analysisId = json.id || json.analysisId || json.report_id || nanoid();
-        json.id = analysisId;
-        json.created_at =
-          typeof json.created_at === "string" ? json.created_at : new Date().toISOString();
+        // Ensure id + timestamp
+        const analysisId =
+          (json as any).id ||
+          (json as any).analysisId ||
+          (json as any).report_id ||
+          nanoid();
 
-        // 5️⃣ — Save photos locally
+        (json as any).id = analysisId;
+        (json as any).created_at =
+          typeof (json as any).created_at === "string"
+            ? (json as any).created_at
+            : new Date().toISOString();
+
+        // Save photos locally
         savePhotoHistory(analysisId, { frontUri, sideUri, backUri });
 
-        // 6️⃣ — Save result to Zustand (ONLY valid payloads reach here)
-        saveResult(json);
-
-        // 7️⃣ — Route to /results always (premium screen self-gates)
-        router.replace("/results");
+        clearWatchdog();
+        await finishAndNavigate(json);
       } catch (e: any) {
         console.log("❌ analyze crash:", e);
         goInvalid({
           badAngle: "front",
           reason: "analysis_crash",
-          message: "Something went wrong while analyzing your photos. Please try again.",
+          message:
+            "Something went wrong while analyzing your photos. Please try again.",
         });
       }
     };
 
     run();
-  }, [router, saveResult]);
+  }, [
+    hasHydratedAuth,
+    hasBootstrappedSession,
+    ensureSessionReady,
+    readBase64,
+    goInvalid,
+    finishAndNavigate,
+  ]);
 
-  /* --------------------------------------------
-   * UI
-   * ------------------------------------------ */
   return (
     <View style={styles.container}>
       <View style={styles.card}>
@@ -258,7 +428,7 @@ export default function AnalyzingScreen() {
         </LinearGradient>
 
         <Text style={styles.title}>Analyzing Your Physique</Text>
-        <Text style={styles.subtitle}>Combining angles and evaluating proportions…</Text>
+        <Text style={styles.subtitle}>{subtitle}</Text>
 
         <View style={styles.progressTrack}>
           <View style={[styles.progressFill, { width: `${progress}%` }]} />
@@ -272,9 +442,6 @@ export default function AnalyzingScreen() {
   );
 }
 
-/* --------------------------------------------
- * Styles
- * ------------------------------------------ */
 const styles = StyleSheet.create({
   container: {
     flex: 1,

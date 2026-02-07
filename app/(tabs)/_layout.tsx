@@ -1,23 +1,31 @@
 // app/(tabs)/_layout.tsx
-import { Tabs, useRouter } from "expo-router";
-import { Ionicons } from "@expo/vector-icons";
-import { View, StyleSheet } from "react-native";
 import { useEffect } from "react";
-import { useAuthStore } from "../../store/useAuthStore";
+import { View, StyleSheet } from "react-native";
+import { Tabs, useRouter, useSegments } from "expo-router";
+import { Ionicons } from "@expo/vector-icons";
+import { useAuthStore } from "@/store/useAuthStore";
+
+const AUTH_LOGIN_ROUTE = "/login";
 
 export default function TabsLayout() {
   const router = useRouter();
-  const { userId, hasHydrated } = useAuthStore();
+  const segments = useSegments();
+
+  const userId = useAuthStore((s) => s.userId);
+  const hasHydrated = useAuthStore((s) => s.hasHydrated);
+  const hasBootstrappedSession = useAuthStore((s) => s.hasBootstrappedSession);
 
   useEffect(() => {
-    if (!hasHydrated) return;
+    if (!hasHydrated || !hasBootstrappedSession) return;
 
-    // Tabs should be accessible only when logged in
-    if (!userId) {
-      router.replace("/login");
-      return;
+    // If logged out, leave tabs. Avoid spamming replace if already in auth.
+    const first = segments[0] ?? "";
+    const inAuth = first === "login";
+
+    if (!userId && !inAuth) {
+      router.replace(AUTH_LOGIN_ROUTE);
     }
-  }, [hasHydrated, userId, router]);
+  }, [hasHydrated, hasBootstrappedSession, userId, router, segments]);
 
   return (
     <View style={styles.container}>
@@ -34,6 +42,7 @@ export default function TabsLayout() {
           name="analyze"
           options={{
             title: "Analyze",
+            unmountOnBlur: true, // optional: camera-heavy screen
             tabBarIcon: ({ color }) => (
               <Ionicons name="camera-outline" size={22} color={color} />
             ),

@@ -1,19 +1,13 @@
 // app/workout-complete/[sessionId].tsx
 // ----------------------------------------------------
-// WORKOUT COMPLETED SUMMARY
+// WORKOUT COMPLETED SUMMARY (NO DURATION)
 // - Displays workout stats after finishing a session
 // - Integrates with useWorkoutHistoryStore
-// - Shows volume, muscles hit, sets, duration
+// - Shows volume, muscles hit, sets, completed reps
 // ----------------------------------------------------
 
 import React, { useMemo } from "react";
-import {
-  View,
-  Text,
-  StyleSheet,
-  ScrollView,
-  Pressable,
-} from "react-native";
+import { View, Text, StyleSheet, ScrollView, Pressable } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
@@ -21,12 +15,38 @@ import { LinearGradient } from "expo-linear-gradient";
 
 import { useWorkoutHistoryStore } from "../../store/useWorkoutHistoryStore";
 
+type LoggedSet = {
+  target: number | string;
+  actual?: number | null;
+};
+
+type LoggedExercise = {
+  id?: string;
+  name: string;
+  muscle: string;
+  sets: LoggedSet[];
+};
+
+function safeNum(v: any): number | null {
+  if (v === undefined || v === null) return null;
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function getExercisesFromSession(session: any): LoggedExercise[] {
+  const exs =
+    (Array.isArray(session?.exercises) && session.exercises) ||
+    (Array.isArray(session?.entries) && session.entries) ||
+    [];
+  return exs.filter(Boolean);
+}
+
 export default function WorkoutCompleteScreen() {
   const router = useRouter();
   const { sessionId } = useLocalSearchParams<{ sessionId: string }>();
 
   const session = useWorkoutHistoryStore((state) =>
-    state.history.find((s) => s.id === sessionId)
+    state.sessions.find((s: any) => String(s?.id) === String(sessionId))
   );
 
   if (!session) {
@@ -39,41 +59,51 @@ export default function WorkoutCompleteScreen() {
     );
   }
 
+  const exercises = getExercisesFromSession(session);
+
   // -----------------------------------------------------
-  // DERIVED METRICS
+  // DERIVED METRICS (NO DURATION)
   // -----------------------------------------------------
 
-  const totalExercises = session.exercises.length;
+  const totalExercises = exercises.length;
 
-  const totalSets = session.exercises.reduce(
-    (sum, ex) => sum + ex.sets.length,
-    0
-  );
+  const totalSets = exercises.reduce((sum, ex) => sum + (ex.sets?.length || 0), 0);
 
-  const completedSets = session.exercises.reduce(
+  const completedSets = exercises.reduce(
     (sum, ex) =>
-      sum +
-      ex.sets.filter((s) => s.actual !== null && s.actual >= 1).length,
+      sum + (ex.sets || []).filter((s) => safeNum((s as any).actual) != null).length,
     0
   );
 
-  // Volume: sets per muscle
+  const completedReps = exercises.reduce((sum, ex) => {
+    return (
+      sum +
+      (ex.sets || []).reduce((acc, s) => {
+        const a = safeNum((s as any).actual);
+        return acc + (a != null ? a : 0);
+      }, 0)
+    );
+  }, 0);
+
+  // Volume: completed sets per muscle
   const muscleVolume = useMemo(() => {
     const volume: Record<string, number> = {};
-    session.exercises.forEach((ex) => {
-      const muscle = ex.muscle || "Other";
-      const setsCompleted = ex.sets.filter((s) => s.actual !== null).length;
+    exercises.forEach((ex) => {
+      const muscle = (ex.muscle || "Other").trim() || "Other";
+      const setsCompleted = (ex.sets || []).filter((s) => safeNum((s as any).actual) != null).length;
       volume[muscle] = (volume[muscle] || 0) + setsCompleted;
     });
     return volume;
-  }, [session]);
+  }, [exercises]);
 
-  const musclesHit = Object.keys(muscleVolume);
+  const musclesHit = useMemo(() => {
+    return Object.entries(muscleVolume)
+      .filter(([, v]) => v > 0)
+      .sort((a, b) => b[1] - a[1])
+      .map(([k]) => k);
+  }, [muscleVolume]);
 
-  // Duration calculation
-  const start = new Date(session.startedAt);
-  const end = new Date(session.finishedAt);
-  const minutes = Math.round((end.getTime() - start.getTime()) / 60000);
+  const workoutName = (session as any).workoutName ?? (session as any).workout_name ?? "Workout";
 
   // -----------------------------------------------------
 
@@ -82,7 +112,7 @@ export default function WorkoutCompleteScreen() {
       <ScrollView contentContainerStyle={{ padding: 20, paddingBottom: 140 }}>
         {/* HEADER */}
         <Text style={styles.title}>Workout Completed</Text>
-        <Text style={styles.subtitle}>{session.workoutName}</Text>
+        <Text style={styles.subtitle}>{workoutName}</Text>
 
         {/* STATS CARD */}
         <LinearGradient
@@ -92,19 +122,21 @@ export default function WorkoutCompleteScreen() {
           style={styles.card}
         >
           <View style={styles.statRow}>
-            <Ionicons name="time-outline" size={20} color="#CFFFA6" />
-            <Text style={styles.statLabel}>Duration</Text>
-            <Text style={styles.statValue}>{minutes} min</Text>
-          </View>
-
-          <View style={styles.statRow}>
             <Ionicons name="barbell-outline" size={20} color="#7CF9FF" />
-            <Text style={styles.statLabel}>Total Sets</Text>
-            <Text style={styles.statValue}>{completedSets} / {totalSets}</Text>
+            <Text style={styles.statLabel}>Sets</Text>
+            <Text style={styles.statValue}>
+              {completedSets} / {totalSets}
+            </Text>
           </View>
 
           <View style={styles.statRow}>
-            <Ionicons name="list-outline" size={20} color="#B9FF39" />
+            <Ionicons name="repeat-outline" size={20} color="#B9FF39" />
+            <Text style={styles.statLabel}>Completed Reps</Text>
+            <Text style={styles.statValue}>{completedReps}</Text>
+          </View>
+
+          <View style={styles.statRow}>
+            <Ionicons name="list-outline" size={20} color="#CFFFA6" />
             <Text style={styles.statLabel}>Exercises</Text>
             <Text style={styles.statValue}>{totalExercises}</Text>
           </View>
@@ -119,35 +151,44 @@ export default function WorkoutCompleteScreen() {
         {/* MUSCLE VOLUME SECTION */}
         <Text style={styles.sectionTitle}>Volume Breakdown</Text>
 
-        {musclesHit.map((muscle) => (
-          <View key={muscle} style={styles.volumeRow}>
-            <Text style={styles.volumeLabel}>{muscle}</Text>
-            <Text style={styles.volumeValue}>{muscleVolume[muscle]} sets</Text>
-          </View>
-        ))}
+        {musclesHit.length === 0 ? (
+          <Text style={{ color: "#7C9AA4", fontSize: 12, marginBottom: 10 }}>
+            No completed sets logged yet. Tap + during your session to log actual reps.
+          </Text>
+        ) : (
+          musclesHit.map((muscle) => (
+            <View key={muscle} style={styles.volumeRow}>
+              <Text style={styles.volumeLabel}>{muscle}</Text>
+              <Text style={styles.volumeValue}>
+                {muscleVolume[muscle]} set{muscleVolume[muscle] === 1 ? "" : "s"}
+              </Text>
+            </View>
+          ))
+        )}
 
         {/* EXERCISE SUMMARY */}
         <Text style={styles.sectionTitle}>Exercise Summary</Text>
 
-        {session.exercises.map((ex) => (
-          <View key={ex.id} style={styles.exerciseBox}>
-            <Text style={styles.exerciseName}>{ex.name}</Text>
-            <Text style={styles.exerciseMeta}>
-              {ex.sets.filter((s) => s.actual !== null).length} /{" "}
-              {ex.sets.length} sets completed
-            </Text>
-          </View>
-        ))}
+        {exercises.map((ex, idx) => {
+          const sets = ex.sets || [];
+          const done = sets.filter((s) => safeNum((s as any).actual) != null).length;
+
+          return (
+            <View key={String(ex.id ?? `${ex.name}-${idx}`)} style={styles.exerciseBox}>
+              <Text style={styles.exerciseName}>{ex.name}</Text>
+              <Text style={styles.exerciseMeta}>
+                {done} / {sets.length} sets completed
+              </Text>
+            </View>
+          );
+        })}
       </ScrollView>
 
       {/* BOTTOM CTA */}
       <View style={styles.bottomBar}>
         <Pressable
           onPress={() => router.replace("/(tabs)/progress")}
-          style={({ pressed }) => [
-            styles.primaryButtonWrap,
-            pressed && { opacity: 0.9 },
-          ]}
+          style={({ pressed }) => [styles.primaryButtonWrap, pressed && { opacity: 0.9 }]}
         >
           <LinearGradient
             colors={["#2AF5FF", "#B9FF39"]}

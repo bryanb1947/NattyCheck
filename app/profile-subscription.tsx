@@ -1,9 +1,9 @@
 // app/profile-subscription.tsx
 // ------------------------------------------------------
 // Subscription Screen
-// - iOS-native swipe-back (gestureEnabled)
-// - Matches About / Privacy / Terms behavior
-// - Clean premium vs free details, polished copy
+// - Uses ONLY plan_normalized ("free" | "pro")
+// - No legacy plan guessing
+// - Clean, deterministic rendering
 // ------------------------------------------------------
 
 import React from "react";
@@ -24,21 +24,22 @@ import { useAuthStore } from "../store/useAuthStore";
 
 export default function ProfileSubscriptionScreen() {
   const router = useRouter();
-  const { plan, email } = useAuthStore();
 
-  const normalizedPlan =
-    plan === "premium" || plan === "pro" ? "Premium" : "Free";
+  // 🔒 SINGLE SOURCE OF TRUTH
+  const plan = useAuthStore((s) => s.plan); // "free" | "pro"
+  const email = useAuthStore((s) => s.email);
+
+  const isPro = plan === "pro";
 
   function handleManage() {
     Alert.alert(
-      "Manage Subscription",
-      "Connect this button to Stripe, RevenueCat, or your App Store billing portal."
+      isPro ? "Manage Subscription" : "Upgrade to Premium",
+      "Wire this button to RevenueCat / App Store billing portal."
     );
   }
 
   return (
     <>
-      {/* Enables swipe-back like other profile subpages */}
       <Stack.Screen
         options={{
           headerShown: true,
@@ -58,35 +59,35 @@ export default function ProfileSubscriptionScreen() {
 
       <SafeAreaView style={styles.safe}>
         <ScrollView
-          style={styles.scroll}
           showsVerticalScrollIndicator={false}
           contentContainerStyle={{ paddingBottom: 40 }}
+          style={styles.scroll}
         >
-          {/* CURRENT PLAN CARD */}
+          {/* CURRENT PLAN */}
           <LinearGradient
             colors={["#00E6C8", "#9AF65B"]}
             style={styles.planCard}
           >
             <Text style={styles.planLabel}>Current Plan</Text>
-            <Text style={styles.planName}>{normalizedPlan}</Text>
+            <Text style={styles.planName}>{isPro ? "Premium" : "Free"}</Text>
             {!!email && <Text style={styles.planEmail}>{email}</Text>}
           </LinearGradient>
 
-          {/* WHAT YOU GET */}
+          {/* BENEFITS */}
           <View style={styles.card}>
             <Text style={styles.sectionTitle}>What you get</Text>
 
-            {normalizedPlan === "Premium" ? (
+            {isPro ? (
               <>
-                <Bullet text="Unlimited physique scans with full advanced AI breakdown." />
-                <Bullet text="AI-powered workout plans adapted to your training history." />
-                <Bullet text="Monthly progress reports using your first and last scan each month." />
-                <Bullet text="Advanced symmetry, weak point, and hypertrophy targeting analysis." />
+                <Bullet text="Unlimited physique scans with full AI breakdown." />
+                <Bullet text="Advanced muscle symmetry & weak-point analysis." />
+                <Bullet text="AI-generated workout plans tailored to your history." />
+                <Bullet text="Monthly progress reports and trend insights." />
               </>
             ) : (
               <>
-                <Bullet text="Basic physique scans with simplified results." />
-                <Bullet text="Unlock Premium for full analysis, training analytics, and monthly reports." />
+                <Bullet text="Basic physique scans with limited results." />
+                <Bullet text="Upgrade to unlock full AI analysis and workouts." />
               </>
             )}
           </View>
@@ -98,16 +99,14 @@ export default function ProfileSubscriptionScreen() {
               style={styles.cta}
             >
               <Text style={styles.ctaText}>
-                {normalizedPlan === "Premium"
-                  ? "Manage Subscription"
-                  : "Upgrade to Premium"}
+                {isPro ? "Manage Subscription" : "Upgrade to Premium"}
               </Text>
             </LinearGradient>
           </TouchableOpacity>
 
           <Text style={styles.footerHint}>
-            Purchases and billing are securely handled by the App Store or Play
-            Store. NattyCheck never stores your card details.
+            Billing is securely handled by the App Store. NattyCheck never stores
+            your payment details.
           </Text>
         </ScrollView>
       </SafeAreaView>
@@ -138,7 +137,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
   },
 
-  /* PLAN CARD */
   planCard: {
     borderRadius: 18,
     padding: 20,
@@ -149,20 +147,18 @@ const styles = StyleSheet.create({
     color: "#022119",
     fontSize: 12,
     fontWeight: "600",
-    marginBottom: 4,
   },
   planName: {
     color: "#00110A",
     fontSize: 24,
     fontWeight: "800",
-    marginBottom: 6,
+    marginVertical: 6,
   },
   planEmail: {
     color: "#063328",
     fontSize: 12,
   },
 
-  /* CARD SECTIONS */
   card: {
     backgroundColor: "#111417",
     borderRadius: 18,
@@ -176,7 +172,6 @@ const styles = StyleSheet.create({
     marginBottom: 10,
   },
 
-  /* BULLETS */
   bulletRow: {
     flexDirection: "row",
     alignItems: "flex-start",
@@ -197,7 +192,6 @@ const styles = StyleSheet.create({
     lineHeight: 18,
   },
 
-  /* CTA */
   cta: {
     borderRadius: 16,
     paddingVertical: 16,
@@ -216,7 +210,6 @@ const styles = StyleSheet.create({
     color: "#8B97A0",
     fontSize: 11,
     textAlign: "center",
-    marginBottom: 30,
     paddingHorizontal: 16,
   },
 });

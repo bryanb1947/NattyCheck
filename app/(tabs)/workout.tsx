@@ -1,9 +1,11 @@
 // app/(tabs)/workout.tsx
 // ----------------------------------------------------
-// Workout Tab (Updated + AI “Start Workout” fully working)
-// - AI Plan hero redesigned to match session UI
-// - AI Start Workout now launches full workout-session UI
-// - No placeholders, fully functional
+// Workout Tab (AI + Custom)
+//
+// ✅ AI Plan hero redesigned to match session UI
+// ✅ AI Start Workout launches workout-session WITHOUT creating a custom workout
+// ✅ NEXT workout advances based on last completed AI workout (history)
+// ✅ Passes type="ai" + aiPayload into workout-session so history tracks correctly
 // ----------------------------------------------------
 
 import React, { useMemo, useState } from "react";
@@ -25,15 +27,17 @@ import { useRouter } from "expo-router";
 
 import { useWorkoutStore } from "../../store/useWorkoutStore";
 import { useCustomWorkoutsStore } from "../../store/useCustomWorkoutsStore";
+import { useWorkoutHistoryStore } from "../../store/useWorkoutHistoryStore";
 
-if (
-  Platform.OS === "android" &&
-  UIManager.setLayoutAnimationEnabledExperimental
-) {
+if (Platform.OS === "android" && UIManager.setLayoutAnimationEnabledExperimental) {
   UIManager.setLayoutAnimationEnabledExperimental(true);
 }
 
 type WorkoutTabKey = "ai" | "custom";
+
+function isTrainingDay(day: any) {
+  return Array.isArray(day?.exercises) && day.exercises.length > 0;
+}
 
 export default function WorkoutScreen() {
   const router = useRouter();
@@ -41,21 +45,15 @@ export default function WorkoutScreen() {
   // AI Plan (already generated from analysis)
   const { current: plan } = useWorkoutStore();
 
-  // Custom workout store
+  // Workout History (used to compute next AI day)
+  const sessions = useWorkoutHistoryStore((s) => s.sessions);
+
+  // Custom workout store (only for Custom tab)
   const customStore = useCustomWorkoutsStore();
-  const { workouts, createWorkout, updateWorkout } = customStore;
+  const { workouts, createWorkout } = customStore;
 
   const [activeTab, setActiveTab] = useState<WorkoutTabKey>("ai");
   const [expandedDayKey, setExpandedDayKey] = useState<string | null>(null);
-
-  // Pick first training day (not a rest day)
-  const activeDayIndex = useMemo(() => {
-    if (!plan) return 0;
-    const idx = plan.plan.findIndex((d: any) => d.exercises?.length > 0);
-    return idx === -1 ? 0 : idx;
-  }, [plan]);
-
-  const firstDay = plan?.plan[activeDayIndex];
 
   const toggleDay = (key: string) => {
     LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
@@ -63,41 +61,81 @@ export default function WorkoutScreen() {
   };
 
   // -------------------------------------------------------
-  // 🎯 START WORKOUT (AI → LIVE SESSION)
+  // ✅ Determine last completed AI day name (from local history)
+  // -------------------------------------------------------
+  const lastAiDayName = useMemo(() => {
+    if (!sessions?.length) return null;
+
+    const aiSessions = [...sessions]
+      .filter((s: any) => s?.workoutType === "ai" && typeof s?.dayName === "string")
+      .sort((a: any, b: any) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+    const name = aiSessions[0]?.dayName?.trim();
+    return name?.length ? name : null;
+  }, [sessions]);
+
+  // -------------------------------------------------------
+  // ✅ Compute next AI day index:
+  // - if no history → first training day
+  // - else → day after lastAiDayName (skipping rest days)
+  // - wraps around
+  // -------------------------------------------------------
+  const nextAiDayIndex = useMemo(() => {
+    if (!plan?.plan?.length) return 0;
+
+    const days = plan.plan;
+
+    const firstTrainingIdx = (() => {
+      const idx = days.findIndex(isTrainingDay);
+      return idx === -1 ? 0 : idx;
+    })();
+
+    if (!lastAiDayName) return firstTrainingIdx;
+
+    const lastIdx = days.findIndex((d: any) => String(d?.day ?? "").trim() === lastAiDayName);
+    if (lastIdx === -1) return firstTrainingIdx;
+
+    for (let step = 1; step <= days.length; step++) {
+      const idx = (lastIdx + step) % days.length;
+      if (isTrainingDay(days[idx])) return idx;
+    }
+
+    return firstTrainingIdx;
+  }, [plan, lastAiDayName]);
+
+  const nextDay = plan?.plan?.[nextAiDayIndex] ?? null;
+
+  // -------------------------------------------------------
+  // 🎯 START WORKOUT (AI → LIVE SESSION) [Option A]
   // -------------------------------------------------------
   const handleStartWorkoutAi = () => {
-    if (!plan || !firstDay) {
+    if (!plan || !nextDay) {
       Alert.alert("No workout plan", "Generate your AI plan first.");
       return;
     }
 
-    // STEP 1 — Convert the AI day into a custom workout structure
-    const workoutName = `${plan.split_name} — ${firstDay.day}`;
     const sessionId = `ai_${Date.now()}`;
 
-    const newWorkout = createWorkout(workoutName);
+    // ✅ Pass AI workout payload directly (NO custom store writes)
+    const payload = {
+      workoutName: `${plan.split_name} — ${nextDay.day}`,
+      dayName: nextDay.day,
+      exercises: (nextDay.exercises || []).map((ex: any, idx: number) => ({
+        id: `ai_ex_${Date.now()}_${idx}_${Math.random().toString(36).slice(2)}`,
+        name: ex.name,
+        muscle: ex.muscle,
+        sets: ex.sets,
+        reps: ex.reps,
+      })),
+    };
 
-    // Replace its blank day list with our AI day
-    updateWorkout(newWorkout.id, {
-      days: [
-        {
-          id: `ai_day_${Date.now()}`,
-          name: firstDay.day,
-          exercises: firstDay.exercises.map((ex: any) => ({
-            id: `ai_ex_${Math.random().toString(36).slice(2)}`,
-            name: ex.name,
-            muscle: ex.muscle,
-            sets: ex.sets,
-            reps: `${ex.reps}`,
-          })),
-        },
-      ],
-    });
-
-    // STEP 2 — Navigate to the REAL workout-session screen
     router.push({
       pathname: "/workout-session/[sessionId]",
-      params: { sessionId, workoutId: newWorkout.id },
+      params: {
+        sessionId,
+        type: "ai",
+        aiPayload: JSON.stringify(payload),
+      },
     });
   };
 
@@ -136,7 +174,7 @@ export default function WorkoutScreen() {
           return (
             <Pressable
               key={seg.key}
-              onPress={() => setActiveTab(seg.key)}
+              onPress={() => setActiveTab(seg.key as WorkoutTabKey)}
               style={styles.segmentItem}
             >
               {isActive ? (
@@ -159,11 +197,11 @@ export default function WorkoutScreen() {
   );
 
   // -------------------------------------------------------
-  // AI PLAN TAB + New Start Workout UI
+  // AI PLAN TAB
   // -------------------------------------------------------
   const renderAiPlanTab = () => (
     <>
-      {plan && firstDay ? (
+      {plan && nextDay ? (
         <View style={styles.aiHeroContainer}>
           <LinearGradient
             colors={["#2AF5FF20", "#B9FF3920"]}
@@ -176,23 +214,18 @@ export default function WorkoutScreen() {
 
               <View style={styles.metaRow}>
                 <Ionicons name="calendar-outline" size={14} color="#9EE7CF" />
-                <Text style={styles.metaText}>
-                  {plan.days_per_week} days / week
-                </Text>
+                <Text style={styles.metaText}>{plan.days_per_week} days / week</Text>
               </View>
 
               <View style={styles.nextPill}>
-                <Ionicons
-                  name="arrow-forward-circle"
-                  size={14}
-                  color="#B9FF39"
-                />
+                <Ionicons name="arrow-forward-circle" size={14} color="#B9FF39" />
                 <Text style={styles.nextPillText}>
-                  Next: {firstDay.label} ({firstDay.day})
+                  Next: {nextDay.label} ({nextDay.day})
                 </Text>
               </View>
 
-              {/* REAL Start Workout Button */}
+              {!!lastAiDayName && <Text style={styles.lastDoneText}>Last completed: {lastAiDayName}</Text>}
+
               <Pressable onPress={handleStartWorkoutAi} style={{ marginTop: 18 }}>
                 <LinearGradient
                   colors={["#2AF5FF", "#B9FF39"]}
@@ -216,39 +249,26 @@ export default function WorkoutScreen() {
         </View>
       )}
 
-      {/* Weekly Split */}
       {plan && (
         <>
           <Text style={styles.sectionTitle}>Weekly Split</Text>
 
           {plan.plan.map((day: any, index: number) => {
             const key = `${index}-${day.day}`;
-            const isRest = !day.exercises || day.exercises.length === 0;
+            const isRest = !isTrainingDay(day);
             const isExpanded = expandedDayKey === key;
 
             return (
               <View key={key} style={styles.dayCard}>
-                <Pressable
-                  onPress={() => (!isRest ? toggleDay(key) : null)}
-                  style={styles.dayHeader}
-                >
+                <Pressable onPress={() => (!isRest ? toggleDay(key) : null)} style={styles.dayHeader}>
                   <View style={styles.dayHeaderLeft}>
                     <Text style={styles.dayTitle}>{day.day}</Text>
-                    <Text
-                      style={[
-                        styles.dayLabel,
-                        isRest && { color: "#93A3AF" },
-                      ]}
-                    >
-                      {day.label}
-                    </Text>
+                    <Text style={[styles.dayLabel, isRest && { color: "#93A3AF" }]}>{day.label}</Text>
                   </View>
 
                   <View style={styles.dayHeaderRight}>
                     <Text style={styles.exerciseCount}>
-                      {isRest
-                        ? "Rest"
-                        : `${day.exercises!.length} exercises`}
+                      {isRest ? "Rest" : `${day.exercises!.length} exercises`}
                     </Text>
                     {!isRest && (
                       <Ionicons
@@ -262,8 +282,8 @@ export default function WorkoutScreen() {
 
                 {!isRest && isExpanded && (
                   <View style={styles.exerciseList}>
-                    {day.exercises.map((ex: any, i: number) => (
-                      <View key={i} style={styles.exerciseRow}>
+                    {day.exercises.map((ex: any, i2: number) => (
+                      <View key={i2} style={styles.exerciseRow}>
                         <View style={styles.exerciseLeft}>
                           <View style={styles.bullet} />
                           <Text style={styles.exerciseName}>{ex.name}</Text>
@@ -284,9 +304,7 @@ export default function WorkoutScreen() {
           })}
 
           <View style={{ paddingTop: 18, paddingBottom: 8 }}>
-            <Text style={styles.disclaimer}>
-              Your AI plan updates as your physique changes.
-            </Text>
+            <Text style={styles.disclaimer}>Your AI plan updates as your physique changes.</Text>
           </View>
         </>
       )}
@@ -300,9 +318,7 @@ export default function WorkoutScreen() {
     <>
       <View style={[styles.customHero, styles.aiHeroContainer]}>
         <Text style={styles.customHeroTitle}>Your Custom Workouts</Text>
-        <Text style={styles.customHeroSubtitle}>
-          Build and tailor your own routines.
-        </Text>
+        <Text style={styles.customHeroSubtitle}>Build and tailor your own routines.</Text>
 
         <Pressable onPress={handleCreateCustomWorkout} style={{ marginTop: 16 }}>
           <LinearGradient
@@ -312,14 +328,11 @@ export default function WorkoutScreen() {
             style={styles.customHeroButton}
           >
             <Ionicons name="add" size={18} color="#021015" />
-            <Text style={styles.customHeroButtonText}>
-              Create Custom Workout
-            </Text>
+            <Text style={styles.customHeroButtonText}>Create Custom Workout</Text>
           </LinearGradient>
         </Pressable>
       </View>
 
-      {/* List */}
       {workouts.length === 0 ? (
         <View style={styles.customEmptyCard}>
           <Text style={styles.customEmptyTitle}>No custom workouts</Text>
@@ -331,35 +344,24 @@ export default function WorkoutScreen() {
         <View style={{ marginTop: 16 }}>
           {workouts.map((w) => {
             const totalDays = w.days.length;
-            const totalExercises = w.days.reduce(
-              (sum, d) => sum + d.exercises.length,
-              0
-            );
+            const totalExercises = w.days.reduce((sum, d) => sum + d.exercises.length, 0);
 
             return (
               <Pressable
                 key={w.id}
                 onPress={() => handleOpenCustomWorkout(w.id)}
-                style={({ pressed }) => [
-                  styles.customCard,
-                  pressed && { opacity: 0.7 },
-                ]}
+                style={({ pressed }) => [styles.customCard, pressed && { opacity: 0.7 }]}
               >
                 <View style={{ flex: 1, paddingRight: 10 }}>
                   <Text style={styles.customName}>{w.name}</Text>
                   <Text style={styles.customMeta}>
-                    {totalDays} day{totalDays === 1 ? "" : "s"} ·{" "}
-                    {totalExercises} exercise
+                    {totalDays} day{totalDays === 1 ? "" : "s"} · {totalExercises} exercise
                     {totalExercises === 1 ? "" : "s"}
                   </Text>
                 </View>
 
                 <View style={styles.customOpenButton}>
-                  <Ionicons
-                    name="chevron-forward"
-                    size={18}
-                    color="#9AF65B"
-                  />
+                  <Ionicons name="chevron-forward" size={18} color="#9AF65B" />
                 </View>
               </Pressable>
             );
@@ -371,17 +373,12 @@ export default function WorkoutScreen() {
 
   return (
     <SafeAreaView style={styles.safeArea} edges={["top", "left", "right"]}>
-      <ScrollView
-        showsVerticalScrollIndicator={false}
-        contentContainerStyle={{ padding: 16, paddingBottom: 160 }}
-      >
-        {/* Header */}
+      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ padding: 16, paddingBottom: 160 }}>
         <View style={styles.headerRow}>
           <Text style={styles.headerTitle}>Workouts</Text>
         </View>
 
         {renderSegmentedControl()}
-
         {activeTab === "ai" ? renderAiPlanTab() : renderCustomTab()}
       </ScrollView>
     </SafeAreaView>
@@ -392,10 +389,7 @@ export default function WorkoutScreen() {
 // STYLES
 // -------------------------------------------------------
 const styles = StyleSheet.create({
-  safeArea: {
-    flex: 1,
-    backgroundColor: "#05080C",
-  },
+  safeArea: { flex: 1, backgroundColor: "#05080C" },
 
   headerRow: {
     flexDirection: "row",
@@ -404,11 +398,7 @@ const styles = StyleSheet.create({
     marginBottom: 12,
     marginTop: 4,
   },
-  headerTitle: {
-    color: "#F5FFFB",
-    fontSize: 22,
-    fontWeight: "800",
-  },
+  headerTitle: { color: "#F5FFFB", fontSize: 22, fontWeight: "800" },
 
   segmentWrapper: { marginBottom: 18 },
   segmentPill: {
@@ -419,12 +409,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "rgba(255,255,255,0.04)",
   },
-  segmentItem: {
-    flex: 1,
-    alignItems: "center",
-    justifyContent: "center",
-    paddingVertical: 6,
-  },
+  segmentItem: { flex: 1, alignItems: "center", justifyContent: "center", paddingVertical: 6 },
   segmentGradient: {
     borderRadius: 999,
     paddingVertical: 8,
@@ -432,16 +417,8 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     width: "100%",
   },
-  segmentLabel: {
-    color: "#8A9BA8",
-    fontSize: 13,
-    fontWeight: "600",
-  },
-  segmentLabelActive: {
-    color: "#021015",
-    fontSize: 13,
-    fontWeight: "800",
-  },
+  segmentLabel: { color: "#8A9BA8", fontSize: 13, fontWeight: "600" },
+  segmentLabelActive: { color: "#021015", fontSize: 13, fontWeight: "800" },
 
   aiHeroContainer: { marginBottom: 20 },
   aiHeroBorder: { padding: 2, borderRadius: 20 },
@@ -471,11 +448,9 @@ const styles = StyleSheet.create({
     alignItems: "center",
     gap: 6,
   },
-  nextPillText: {
-    color: "#CFFFA6",
-    fontSize: 12,
-    fontWeight: "600",
-  },
+  nextPillText: { color: "#CFFFA6", fontSize: 12, fontWeight: "600" },
+
+  lastDoneText: { marginTop: 10, color: "#7C9AA4", fontSize: 12 },
 
   sessionStartBtn: {
     height: 46,
@@ -485,11 +460,7 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     gap: 8,
   },
-  sessionStartText: {
-    color: "#052e1f",
-    fontSize: 16,
-    fontWeight: "800",
-  },
+  sessionStartText: { color: "#052e1f", fontSize: 16, fontWeight: "800" },
 
   noPlanHero: {
     padding: 18,
@@ -497,25 +468,10 @@ const styles = StyleSheet.create({
     backgroundColor: "#0D1318",
     marginBottom: 20,
   },
-  noPlanTitle: {
-    color: "#E6FBF0",
-    fontSize: 18,
-    fontWeight: "800",
-  },
-  noPlanDesc: {
-    color: "#9AA9B2",
-    fontSize: 13,
-    lineHeight: 19,
-    marginTop: 6,
-  },
+  noPlanTitle: { color: "#E6FBF0", fontSize: 18, fontWeight: "800" },
+  noPlanDesc: { color: "#9AA9B2", fontSize: 13, lineHeight: 19, marginTop: 6 },
 
-  sectionTitle: {
-    color: "#D7FBE8",
-    fontSize: 16,
-    fontWeight: "700",
-    marginTop: 6,
-    marginBottom: 10,
-  },
+  sectionTitle: { color: "#D7FBE8", fontSize: 16, fontWeight: "700", marginTop: 6, marginBottom: 10 },
 
   dayCard: {
     backgroundColor: "#0d1115",
@@ -524,26 +480,13 @@ const styles = StyleSheet.create({
     borderColor: "rgba(255,255,255,0.05)",
     marginBottom: 10,
   },
-  dayHeader: {
-    paddingHorizontal: 16,
-    paddingVertical: 15,
-    flexDirection: "row",
-    alignItems: "center",
-  },
+  dayHeader: { paddingHorizontal: 16, paddingVertical: 15, flexDirection: "row", alignItems: "center" },
   dayHeaderLeft: { flex: 1 },
   dayTitle: { color: "#E6FBF0", fontSize: 15, fontWeight: "700" },
   dayLabel: { marginTop: 4, color: "#A0B8C2", fontSize: 12 },
 
-  dayHeaderRight: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-  },
-  exerciseCount: {
-    color: "#9EE7CF",
-    fontSize: 12,
-    fontWeight: "600",
-  },
+  dayHeaderRight: { flexDirection: "row", alignItems: "center", gap: 8 },
+  exerciseCount: { color: "#9EE7CF", fontSize: 12, fontWeight: "600" },
 
   exerciseList: { paddingHorizontal: 14, paddingBottom: 10, gap: 10 },
 
@@ -558,24 +501,9 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "space-between",
   },
-  exerciseLeft: {
-    flexDirection: "row",
-    gap: 10,
-    alignItems: "center",
-    flex: 1,
-  },
-  bullet: {
-    width: 8,
-    height: 8,
-    borderRadius: 999,
-    backgroundColor: "#2AF5FF",
-  },
-  exerciseName: {
-    color: "#E8FDF2",
-    fontSize: 14,
-    fontWeight: "600",
-    flexShrink: 1,
-  },
+  exerciseLeft: { flexDirection: "row", gap: 10, alignItems: "center", flex: 1 },
+  bullet: { width: 8, height: 8, borderRadius: 999, backgroundColor: "#2AF5FF" },
+  exerciseName: { color: "#E8FDF2", fontSize: 14, fontWeight: "600", flexShrink: 1 },
   exerciseMeta: { alignItems: "flex-end" },
   exerciseSmall: { color: "#96A8B2", fontSize: 12, fontWeight: "600" },
 
@@ -588,12 +516,7 @@ const styles = StyleSheet.create({
     borderColor: "rgba(0,230,200,0.25)",
     borderWidth: 1,
   },
-  customHeroTitle: {
-    color: "#F5FFFB",
-    fontSize: 18,
-    fontWeight: "800",
-    marginBottom: 4,
-  },
+  customHeroTitle: { color: "#F5FFFB", fontSize: 18, fontWeight: "800", marginBottom: 4 },
   customHeroSubtitle: { color: "#9FB1BD", fontSize: 13 },
 
   customHeroButton: {
@@ -604,11 +527,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     gap: 6,
   },
-  customHeroButtonText: {
-    color: "#021015",
-    fontWeight: "800",
-    fontSize: 15,
-  },
+  customHeroButtonText: { color: "#021015", fontWeight: "800", fontSize: 15 },
 
   customEmptyCard: {
     backgroundColor: "#111417",
@@ -618,17 +537,8 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "rgba(255,255,255,0.03)",
   },
-  customEmptyTitle: {
-    color: "#FFFFFF",
-    fontSize: 15,
-    fontWeight: "700",
-    marginBottom: 6,
-  },
-  customEmptyText: {
-    color: "#7C8A96",
-    fontSize: 13,
-    lineHeight: 18,
-  },
+  customEmptyTitle: { color: "#FFFFFF", fontSize: 15, fontWeight: "700", marginBottom: 6 },
+  customEmptyText: { color: "#7C8A96", fontSize: 13, lineHeight: 18 },
 
   customCard: {
     backgroundColor: "#111417",
@@ -643,6 +553,7 @@ const styles = StyleSheet.create({
   },
   customName: { color: "#FFFFFF", fontSize: 15, fontWeight: "700" },
   customMeta: { color: "#7C8A96", fontSize: 13 },
+
   customOpenButton: {
     width: 32,
     height: 32,

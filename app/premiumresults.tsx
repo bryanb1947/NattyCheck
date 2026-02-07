@@ -1,16 +1,19 @@
 // app/premiumresults.tsx
 // ------------------------------------------------------
-// Premium Results Screen
-// - Gated by /profiles entitlements (free/trial/paid)
-// - Renders full physique analysis (score, bodyfat, symmetry,
-//   muscle groups, definition, ratios, AI notes)
-// - Saves report → analysis_history
-// - Generates workout via backend /workout/generate
-//   (backend uses onboarding + cardio/abs logic
-//    + training_summary from workout history)
+// Premium Results Screen (ANON-FIRST + NO PAYWALL LOOP + FORCED CLAIM)
+// - Supports anonymous users (guest sessions) for onboarding + scan
+// - Gates full render by profiles.plan_normalized === "pro"
+// - Prevents paywall loop right after purchase by:
+//   1) best-effort RevenueCat -> Supabase sync
+//   2) retrying profile fetch briefly
+// - FORCED CLAIM:
+//   ✅ If user is Pro but session user has no email (anon), force /claimaccount
+// - If results store is empty, fetch latest analysis_history for this user
+// - Generates workout via POST /workout/generate (AUTH REQUIRED)
+//   ✅ uses lib/api.ts authedPost to attach Supabase JWT
 // ------------------------------------------------------
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState, useCallback } from "react";
 import {
   View,
   Text,
@@ -19,6 +22,7 @@ import {
   TouchableOpacity,
   Alert,
   Platform,
+  ActivityIndicator,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { LinearGradient } from "expo-linear-gradient";
@@ -34,14 +38,14 @@ import {
   type LoggedExercise,
 } from "../store/useWorkoutHistoryStore";
 
+import { syncEntitlementsToSupabase } from "@/lib/revenuecat";
+import { authedPost } from "@/lib/api";
+
 const GUTTER = 16;
 
-const BACKEND_BASE = "https://nattycheck-backend-production.up.railway.app";
-
 /* ---------------------------------------------------------
- * TRAINING SUMMARY HELPERS (for GPT)
+ * TRAINING SUMMARY HELPERS
  * --------------------------------------------------------*/
-
 type VolumeBucket =
   | "chest"
   | "back"
@@ -86,7 +90,6 @@ function mapExerciseToBuckets(ex: LoggedExercise): VolumeBucket[] {
   const name = (ex.name || "").toLowerCase();
   const buckets = new Set<VolumeBucket>();
 
-  // Chest
   if (
     muscle.includes("chest") ||
     name.includes("bench") ||
@@ -95,7 +98,6 @@ function mapExerciseToBuckets(ex: LoggedExercise): VolumeBucket[] {
     buckets.add("chest");
   }
 
-  // Back
   if (
     muscle.includes("back") ||
     name.includes("row") ||
@@ -111,11 +113,7 @@ function mapExerciseToBuckets(ex: LoggedExercise): VolumeBucket[] {
     buckets.add("back");
   }
 
-  // Delts / shoulders
-  if (
-    muscle.includes("rear") &&
-    (muscle.includes("delt") || muscle.includes("shoulder"))
-  ) {
+  if (muscle.includes("rear") && (muscle.includes("delt") || muscle.includes("shoulder"))) {
     buckets.add("rear_delts");
   } else if (
     (muscle.includes("lateral") || muscle.includes("side")) &&
@@ -140,10 +138,8 @@ function mapExerciseToBuckets(ex: LoggedExercise): VolumeBucket[] {
     buckets.add("front_delts");
   }
 
-  // Arms
-  if (muscle.includes("bicep") || name.includes("curl")) {
-    buckets.add("biceps");
-  }
+  if (muscle.includes("bicep") || name.includes("curl")) buckets.add("biceps");
+
   if (
     muscle.includes("tricep") ||
     name.includes("skullcrusher") ||
@@ -154,7 +150,6 @@ function mapExerciseToBuckets(ex: LoggedExercise): VolumeBucket[] {
     buckets.add("triceps");
   }
 
-  // Legs
   if (
     muscle.includes("quad") ||
     name.includes("squat") ||
@@ -163,6 +158,7 @@ function mapExerciseToBuckets(ex: LoggedExercise): VolumeBucket[] {
   ) {
     buckets.add("quads");
   }
+
   if (
     muscle.includes("hamstring") ||
     name.includes("leg curl") ||
@@ -172,14 +168,13 @@ function mapExerciseToBuckets(ex: LoggedExercise): VolumeBucket[] {
   ) {
     buckets.add("hamstrings");
   }
+
   if (muscle.includes("glute") || name.includes("hip thrust") || name.includes("glute")) {
     buckets.add("glutes");
   }
-  if (muscle.includes("calf") || name.includes("calf")) {
-    buckets.add("calves");
-  }
 
-  // Core
+  if (muscle.includes("calf") || name.includes("calf")) buckets.add("calves");
+
   if (
     muscle.includes("core") ||
     muscle.includes("abs") ||
@@ -203,7 +198,7 @@ function buildTrainingSummary(sessions: WorkoutSession[]): TrainingSummaryForGPT
   const cutoff = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
 
   const recent = safeSessions.filter((s) => {
-    const d = new Date(s.date);
+    const d = new Date((s as any).date);
     return d >= cutoff && !isNaN(d.getTime());
   });
 
@@ -222,7 +217,6 @@ function buildTrainingSummary(sessions: WorkoutSession[]): TrainingSummaryForGPT
     }
   }
 
-  // Include zero-volume buckets so "undertrained" is meaningful.
   const entries = (Object.entries(volume) as [VolumeBucket, number][])
     .slice()
     .sort((a, b) => b[1] - a[1]);
@@ -240,67 +234,21 @@ function buildTrainingSummary(sessions: WorkoutSession[]): TrainingSummaryForGPT
 }
 
 /* ---------------------------------------------------------
- * ENTITLEMENT HELPERS (free / trial / paid)
+ * RESULT SHAPE HELPERS
  * --------------------------------------------------------*/
-
-function normalizePlanToProOrFree(profile: any): "pro" | "free" {
-  const rawPlan = String(profile?.plan || "").toLowerCase();
-  const isPremium = profile?.is_premium === true;
-
-  const premiumUntilStr = profile?.premium_until;
-  const premiumUntil =
-    typeof premiumUntilStr === "string" ? new Date(premiumUntilStr) : null;
-  const premiumStillActive =
-    premiumUntil instanceof Date &&
-    !isNaN(premiumUntil.getTime()) &&
-    premiumUntil.getTime() > Date.now();
-
-  const trialActive = profile?.trial_active === true;
-
-  const paidPlan =
-    rawPlan === "pro" ||
-    rawPlan === "premium" ||
-    rawPlan === "paid" ||
-    rawPlan === "plus";
-
-  // store supports only "free" | "pro"
-  // trial behaves like pro for unlock.
-  if (isPremium || paidPlan || premiumStillActive || trialActive) return "pro";
-  return "free";
-}
-
-/* ---------------------------------------------------------
- * RESULT SHAPE HELPERS (prevents "blank screen" on wrapper)
- * --------------------------------------------------------*/
-
 function unwrapAnalysis(obj: any): any {
   if (!obj || typeof obj !== "object") return obj;
-
-  const cand =
-    obj.result ||
-    obj.analysis ||
-    obj.data ||
-    obj.payload ||
-    obj.output ||
-    obj.response;
-
+  const cand = obj.result || obj.analysis || obj.data || obj.payload || obj.output || obj.response;
   if (cand && typeof cand === "object") return cand;
   return obj;
 }
 
 function isNonEmptyRecord(v: any): boolean {
-  return (
-    !!v &&
-    typeof v === "object" &&
-    !Array.isArray(v) &&
-    Object.keys(v).length > 0
-  );
+  return !!v && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length > 0;
 }
 
 function pickFirst<T>(...vals: T[]): T | undefined {
-  for (const v of vals) {
-    if (v !== undefined && v !== null) return v;
-  }
+  for (const v of vals) if (v !== undefined && v !== null) return v;
   return undefined;
 }
 
@@ -310,22 +258,27 @@ function safeNumber(v: any): number | null {
   return isNaN(n) ? null : n;
 }
 
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 /* ---------------------------------------------------------
  * COMPONENT
  * --------------------------------------------------------*/
-
 export default function PremiumResults() {
   const router = useRouter();
 
+  // store result (may be empty on cold boot / restore)
   const rawResult = useResultsStore((s) => s.last);
-  const result = useMemo(() => unwrapAnalysis(rawResult), [rawResult]);
+  const resultFromStore = useMemo(() => unwrapAnalysis(rawResult), [rawResult]);
 
-  const userId = useAuthStore((s) => s.userId);
+  // auth store
   const email = useAuthStore((s) => s.email);
   const setIdentity = useAuthStore((s) => s.setIdentity);
   const setPlan = useAuthStore((s) => s.setPlan);
-  const hasHydrated = useAuthStore.persist.hasHydrated();
+  const hasBootstrappedSession = useAuthStore((s) => s.hasBootstrappedSession);
 
+  // workout
   const setWorkout = useWorkoutStore((s) => s.setWorkout);
   const workoutSessions = useWorkoutHistoryStore((s) => s.sessions);
 
@@ -334,127 +287,207 @@ export default function PremiumResults() {
     [workoutSessions]
   );
 
+  // UI states
   const [saving, setSaving] = useState(false);
   const [generating, setGenerating] = useState(false);
+
+  // gate state
   const [checking, setChecking] = useState(true);
+  const [entitlementError, setEntitlementError] = useState<string | null>(null);
+  const [uid, setUid] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (!hasHydrated) return;
-    validateAccess();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasHydrated]);
+  // if store is empty, we’ll fetch latest from DB
+  const [fallbackAnalysis, setFallbackAnalysis] = useState<any | null>(null);
 
-  async function validateAccess() {
+  const effectiveResult = useMemo(() => {
+    return fallbackAnalysis ? unwrapAnalysis(fallbackAnalysis) : resultFromStore;
+  }, [fallbackAnalysis, resultFromStore]);
+
+  /* ---------------------------------------------------------
+     Fetch latest analysis_history if results store is empty
+  --------------------------------------------------------*/
+  const fetchLatestAnalysisIfMissing = useCallback(
+    async (_uid: string) => {
+      if (resultFromStore) return;
+
+      try {
+        const { data, error } = await supabase
+          .from("analysis_history")
+          .select("*")
+          .eq("user_id", _uid)
+          .order("created_at", { ascending: false })
+          .limit(1);
+
+        if (error) {
+          console.log("🟨 PremiumResults latest analysis fetch error:", error.message);
+          return;
+        }
+
+        const row = Array.isArray(data) ? data[0] : null;
+        if (row) {
+          setFallbackAnalysis(row);
+          console.log("✅ PremiumResults loaded latest analysis_history fallback:", {
+            id: row.id,
+            created_at: row.created_at,
+          });
+        }
+      } catch (e: any) {
+        console.log("🟨 PremiumResults latest analysis fetch crash:", e?.message ?? e);
+      }
+    },
+    [resultFromStore]
+  );
+
+  /* ---------------------------------------------------------
+     Validate Pro access + FORCE CLAIM if anon Pro
+  --------------------------------------------------------*/
+  const validateAccess = useCallback(async () => {
+    setChecking(true);
+    setEntitlementError(null);
+
     try {
-      if (!userId) {
-        router.replace("/login");
-        return;
-      }
+      const { data: sessData, error: sessErr } = await supabase.auth.getSession();
+      if (sessErr) console.log("🟦 PremiumResults getSession error:", sessErr);
 
-      // Keep identity synced (plan comes from DB)
-      setIdentity({ userId, email });
+      const session = sessData?.session ?? null;
+      const user = session?.user ?? null;
 
-      const { data, error } = await supabase
-        .from("profiles")
-        .select("*")
-        .eq("user_id", userId)
-        .maybeSingle();
-
-      if (error) {
-        console.log("❌ Profile fetch error in PremiumResults:", error);
+      // IMPORTANT: PremiumResults requires a session (anon or authed)
+      if (!user?.id) {
         setPlan("free");
-        router.replace("/paywall");
+        router.replace({ pathname: "/paywall", params: { next: "/premiumresults" } } as any);
         return;
       }
 
-      if (!data) {
-        console.log("⚠️ No profiles row found. Treating as FREE → paywall.");
-        setPlan("free");
-        router.replace("/paywall");
-        return;
+      const _uid = user.id;
+      const _email = user.email ?? null;
+
+      setUid(_uid);
+      setIdentity({ userId: _uid, email: _email ?? email ?? null });
+
+      // best-effort RC -> Supabase sync
+      try {
+        await syncEntitlementsToSupabase();
+      } catch (e) {
+        console.log("⚠️ syncEntitlementsToSupabase failed (non-blocking):", e);
       }
 
-      const normalized = normalizePlanToProOrFree(data);
-      setPlan(normalized);
+      const attempts = 8; // ~4s
+      for (let i = 0; i < attempts; i++) {
+        const { data: profile, error } = await supabase
+          .from("profiles")
+          .select("user_id, plan_normalized, plan_raw, updated_at")
+          .eq("user_id", _uid)
+          .maybeSingle();
 
-      if (normalized !== "pro") {
-        router.replace("/paywall");
-        return;
+        if (error) {
+          setPlan("free");
+          setEntitlementError(error.message ?? "Failed to check entitlement.");
+          break;
+        }
+
+        const normalized = profile?.plan_normalized === "pro" ? "pro" : "free";
+        setPlan(normalized);
+
+        if (normalized === "pro") {
+          // ✅ FORCED CLAIM: pro but no email => must claim before seeing premium
+          if (!_email) {
+            router.replace({ pathname: "/claimaccount", params: { next: "/premiumresults" } } as any);
+            return;
+          }
+
+          await fetchLatestAnalysisIfMissing(_uid);
+          setEntitlementError(null);
+          return;
+        }
+
+        await sleep(500);
       }
-    } catch (e) {
-      console.log("❌ validateAccess crashed:", e);
+
+      // Not pro -> paywall
+      router.replace({ pathname: "/paywall", params: { next: "/premiumresults" } } as any);
+    } catch (e: any) {
+      console.log("❌ validateAccess crashed:", e?.message ?? e);
       setPlan("free");
-      router.replace("/paywall");
-      return;
+      router.replace({ pathname: "/paywall", params: { next: "/premiumresults" } } as any);
     } finally {
       setChecking(false);
     }
-  }
+  }, [router, email, setIdentity, setPlan, fetchLatestAnalysisIfMissing]);
 
   useEffect(() => {
-    if (!rawResult) return;
+    if (!hasBootstrappedSession) return;
+    validateAccess();
+  }, [hasBootstrappedSession, validateAccess]);
 
-    const unwrapped = unwrapAnalysis(rawResult);
-
-    const dbgGroups =
-      pickFirst(
-        (unwrapped as any)?.groups,
-        (unwrapped as any)?.muscles,
-        (unwrapped as any)?.muscle_groups,
-        (unwrapped as any)?.muscleScores
-      ) || {};
-
-    const dbgDefinition =
-      pickFirst(
-        (unwrapped as any)?.definition,
-        (unwrapped as any)?.def,
-        (unwrapped as any)?.definition_scores
-      ) || {};
-
-    console.log("✅ PremiumResults hydrated, result snapshot:", {
-      raw_keys: Object.keys(rawResult || {}),
-      unwrapped_keys: Object.keys(unwrapped || {}),
-      id:
-        (unwrapped as any)?.id ??
-        (unwrapped as any)?.analysisId ??
-        (unwrapped as any)?.report_id,
-      score: (unwrapped as any)?.score ?? (unwrapped as any)?.overall_score,
-      hasGroups: isNonEmptyRecord(dbgGroups),
-      hasDefinition: isNonEmptyRecord(dbgDefinition),
-      created_at: (unwrapped as any)?.created_at,
-    });
-
-    console.log("📊 Training summary for GPT:", trainingSummary);
-  }, [rawResult, trainingSummary]);
-
-  if (!hasHydrated || checking || !rawResult) {
+  // Loading / gating UI
+  if (!hasBootstrappedSession || checking) {
     return (
       <SafeAreaView style={styles.loadingScreen}>
-        <Text style={{ color: "white" }}>Loading full analysis…</Text>
-      </SafeAreaView>
-    );
-  }
-
-  // Backend may return { ok:false } OR { success:false }
-  if ((result as any)?.ok === false || (result as any)?.success === false) {
-    return (
-      <SafeAreaView style={styles.loadingScreen}>
-        <Text style={{ color: "white", textAlign: "center", paddingHorizontal: 20 }}>
-          We couldn’t read your photos. Please retake your shots.
+        <ActivityIndicator size="large" color="#00E6C8" />
+        <Text style={styles.loadingText}>Checking your Pro access…</Text>
+        <Text style={styles.loadingSub}>
+          If you just purchased, this can take a moment to sync.
         </Text>
       </SafeAreaView>
     );
   }
 
-  const parsed: any = result || {};
+  if (entitlementError) {
+    return (
+      <SafeAreaView style={styles.loadingScreen}>
+        <Text style={styles.errorTitle}>We can’t confirm Pro access yet</Text>
+        <Text style={styles.errorBody}>{entitlementError}</Text>
 
-  const analysisId: string | undefined =
-    parsed.id || parsed.analysisId || parsed.report_id;
+        <TouchableOpacity onPress={validateAccess} activeOpacity={0.85} style={{ marginTop: 16 }}>
+          <LinearGradient colors={["#00E6C8", "#9AF65B"]} style={styles.retryBtn}>
+            <Text style={styles.retryText}>Retry</Text>
+          </LinearGradient>
+        </TouchableOpacity>
 
+        <TouchableOpacity
+          onPress={() =>
+            router.replace({ pathname: "/paywall", params: { next: "/premiumresults" } } as any)
+          }
+          activeOpacity={0.85}
+          style={{ marginTop: 12 }}
+        >
+          <Text style={{ color: "#9AF65B", fontWeight: "800" }}>Back to Paywall</Text>
+        </TouchableOpacity>
+      </SafeAreaView>
+    );
+  }
+
+  // Missing analysis (store empty AND db empty)
+  if (!effectiveResult) {
+    return (
+      <SafeAreaView style={styles.loadingScreen}>
+        <Text style={styles.emptyText}>
+          We couldn’t find your latest analysis.{"\n\n"}
+          Please run a new scan to see your premium breakdown.
+        </Text>
+
+        <TouchableOpacity onPress={() => router.replace("/(tabs)/analyze")} style={{ marginTop: 18 }}>
+          <Text style={{ color: "#9AF65B", fontWeight: "800" }}>Go to Analyze</Text>
+        </TouchableOpacity>
+      </SafeAreaView>
+    );
+  }
+
+  // Analyze failed
+  if ((effectiveResult as any)?.ok === false || (effectiveResult as any)?.success === false) {
+    return (
+      <SafeAreaView style={styles.loadingScreen}>
+        <Text style={styles.emptyText}>We couldn’t read your photos. Please retake your shots.</Text>
+      </SafeAreaView>
+    );
+  }
+
+  const parsed: any = effectiveResult || {};
+
+  const analysisId: string | undefined = parsed.id || parsed.analysisId || parsed.report_id;
   const createdAtISO: string =
-    typeof parsed.created_at === "string"
-      ? parsed.created_at
-      : new Date().toISOString();
+    typeof parsed.created_at === "string" ? parsed.created_at : new Date().toISOString();
 
   const headerDateLabel = new Date(createdAtISO).toLocaleDateString(undefined, {
     month: "short",
@@ -463,12 +496,7 @@ export default function PremiumResults() {
   });
 
   const groups: Record<string, number> =
-    pickFirst(
-      parsed.groups,
-      parsed.muscles,
-      parsed.muscle_groups,
-      parsed.muscleScores
-    ) || {};
+    pickFirst(parsed.groups, parsed.muscles, parsed.muscle_groups, parsed.muscleScores) || {};
 
   const advanced: Record<string, number> =
     pickFirst(parsed.advanced, parsed.ratios, parsed.metrics) || {};
@@ -477,8 +505,7 @@ export default function PremiumResults() {
     pickFirst(parsed.definition, parsed.def, parsed.definition_scores) || {};
 
   const definitionNotes: string =
-    pickFirst(parsed.definitionNotes, parsed.definition_notes, parsed.def_notes) ||
-    "";
+    pickFirst(parsed.definitionNotes, parsed.definition_notes, parsed.def_notes) || "";
 
   const definitionSource: string =
     pickFirst(parsed.definitionSource, parsed.definition_source) || "rule_only";
@@ -488,17 +515,8 @@ export default function PremiumResults() {
   const symmetry = pickFirst(parsed.symmetry, parsed.symmetry_score);
   const confidence = pickFirst(parsed.confidence, parsed.confidence_score);
 
-  const trainingLevel = pickFirst(
-    parsed.trainingLevel,
-    parsed.type,
-    parsed.physique_type
-  );
-
-  const detailedSummary = pickFirst(
-    parsed.detailedSummary,
-    parsed.summary,
-    parsed.notes
-  );
+  const trainingLevel = pickFirst(parsed.trainingLevel, parsed.type, parsed.physique_type);
+  const detailedSummary = pickFirst(parsed.detailedSummary, parsed.summary, parsed.notes);
 
   const hasAnything =
     score !== undefined ||
@@ -510,19 +528,13 @@ export default function PremiumResults() {
   if (!hasAnything) {
     return (
       <SafeAreaView style={styles.loadingScreen}>
-        <Text style={{ color: "white", textAlign: "center", paddingHorizontal: 20 }}>
-          PremiumResults loaded, but the analysis payload is missing the fields
-          needed to render (score / groups / definition).
+        <Text style={styles.emptyText}>
+          PremiumResults loaded, but the analysis payload is missing fields needed to render.
           {"\n\n"}
-          This usually means analyzing.tsx stored a wrapper object or only an id.
+          This usually means you stored a wrapper object or only an id.
         </Text>
-        <TouchableOpacity
-          onPress={() => router.replace("/(tabs)/analyze")}
-          style={{ marginTop: 18 }}
-        >
-          <Text style={{ color: "#9AF65B", fontWeight: "800" }}>
-            Back to Analyze
-          </Text>
+        <TouchableOpacity onPress={() => router.replace("/(tabs)/analyze")} style={{ marginTop: 18 }}>
+          <Text style={{ color: "#9AF65B", fontWeight: "800" }}>Back to Analyze</Text>
         </TouchableOpacity>
       </SafeAreaView>
     );
@@ -552,10 +564,10 @@ export default function PremiumResults() {
     "calves",
   ];
 
-  const swr = safeNumber(advanced.shoulder_waist_ratio);
-  const ltr = safeNumber(advanced.leg_torso_ratio);
-  const armImb = safeNumber(advanced.arm_imbalance);
-  const qh = safeNumber(advanced.quad_hamstring_ratio);
+  const swr = safeNumber((advanced as any).shoulder_waist_ratio);
+  const ltr = safeNumber((advanced as any).leg_torso_ratio);
+  const armImb = safeNumber((advanced as any).arm_imbalance);
+  const qh = safeNumber((advanced as any).quad_hamstring_ratio);
 
   function fmt(num: any, digits = 1) {
     const n = safeNumber(num);
@@ -596,14 +608,16 @@ export default function PremiumResults() {
   }
 
   async function saveReport() {
-    if (!userId) {
-      Alert.alert("Login required", "Please sign in again.");
-      router.replace("/login");
+    // session MUST exist already
+    const { data: sessData } = await supabase.auth.getSession();
+    const _uid = sessData?.session?.user?.id ?? uid;
+
+    if (!_uid) {
+      Alert.alert("Error", "Missing user session. Please restart the app.");
       return;
     }
 
     if (!analysisId) {
-      console.log("❌ No analysisId found:", parsed);
       Alert.alert("Unable to save", "Missing analysis ID.");
       return;
     }
@@ -613,26 +627,22 @@ export default function PremiumResults() {
 
       const payload = {
         id: analysisId,
-        user_id: userId,
+        user_id: _uid,
         score: safeNumber(score),
         natty: parsed.natty ?? null,
         bodyfat: safeNumber(bodyfat),
         symmetry: safeNumber(symmetry),
         confidence: safeNumber(confidence),
         type: trainingLevel ?? null,
-        // Store the strength map (your table column is named "muscles")
         muscles: isNonEmptyRecord(groups) ? groups : null,
         created_at: createdAtISO,
       };
 
-      console.log("💾 Upserting analysis_history:", payload);
-
-      const { error } = await supabase
-        .from("analysis_history")
-        .upsert(payload, { onConflict: "id" });
+      const { error } = await supabase.from("analysis_history").upsert(payload, {
+        onConflict: "id",
+      });
 
       if (error) {
-        console.log("❌ Save error:", error);
         Alert.alert("Save failed", error.message);
       } else {
         Alert.alert("Saved!", "Your analysis is stored correctly.");
@@ -643,9 +653,11 @@ export default function PremiumResults() {
   }
 
   async function handleGenerateWorkout() {
-    if (!userId) {
-      Alert.alert("Login required", "Please sign in again.");
-      router.replace("/login");
+    const { data: sessData } = await supabase.auth.getSession();
+    const _uid = sessData?.session?.user?.id ?? uid;
+
+    if (!_uid) {
+      Alert.alert("Error", "Missing user session. Please restart the app.");
       return;
     }
 
@@ -656,9 +668,6 @@ export default function PremiumResults() {
 
     try {
       setGenerating(true);
-
-      // ✅ FIXED: no double /workout/workout
-      const endpoint = `${BACKEND_BASE}/workout/generate`;
 
       const workoutPayload = {
         score: Number(safeNumber(score) ?? 0),
@@ -672,52 +681,30 @@ export default function PremiumResults() {
         training_summary: trainingSummary,
       };
 
-      console.log("📨 Sending workout generation request…", {
-        endpoint,
-        workoutPayload,
-      });
-
-      const resp = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(workoutPayload),
-      });
-
-      const json = await resp.json().catch(() => null);
-      console.log("📥 Workout plan response:", json);
+      const resp = await authedPost("/workout/generate", workoutPayload);
 
       if (!resp.ok) {
         const msg =
-          json?.detail ||
-          json?.message ||
+          (resp.data as any)?.detail ||
+          (resp.data as any)?.message ||
+          (resp.raw ? resp.raw.slice(0, 200) : null) ||
           `Workout generation failed (HTTP ${resp.status}).`;
+
         Alert.alert("Generation failed", msg);
         return;
       }
 
+      const json: any = resp.data;
       if (!json || json.ok !== true || !json.plan) {
-        Alert.alert(
-          "Generation failed",
-          json?.message || "Could not generate a workout plan."
-        );
+        Alert.alert("Generation failed", json?.message || "Could not generate a workout plan.");
         return;
       }
 
-      try {
-        setWorkout(json.plan);
-        console.log("💪 Workout saved to useWorkoutStore.", json.plan);
-      } catch (err) {
-        console.log("⚠️ Zustand workout save error:", err);
-      }
-
-      Alert.alert(
-        "Workout Ready",
-        "Your custom routine (lifting + cardio + abs) has been generated."
-      );
+      setWorkout(json.plan);
+      Alert.alert("Workout Ready", "Your routine (lifting + cardio + abs) has been generated.");
       router.push("/workout");
     } catch (err: any) {
-      console.log("❌ WORKOUT GENERATION ERROR:", err);
-      Alert.alert("Error", "Something went wrong while generating your routine.");
+      Alert.alert("Error", err?.message || "Something went wrong while generating your routine.");
     } finally {
       setGenerating(false);
     }
@@ -729,16 +716,12 @@ export default function PremiumResults() {
 
   return (
     <SafeAreaView style={styles.safeArea}>
-      <ScrollView
-        showsVerticalScrollIndicator={false}
-        contentContainerStyle={styles.pageContent}
-      >
+      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.pageContent}>
         {/* HEADER */}
         <View style={styles.headerRow}>
           <LinearGradient colors={["#00E6C8", "#9AF65B"]} style={styles.logoPill}>
             <Text style={styles.logoText}>N</Text>
           </LinearGradient>
-
           <Text style={styles.headerDate}>{headerDateLabel}</Text>
         </View>
 
@@ -747,9 +730,7 @@ export default function PremiumResults() {
           <LinearGradient colors={["#00E6C8", "#9AF65B"]} style={styles.titleCard}>
             <Text style={styles.titleText}>Premium Physique Analysis</Text>
           </LinearGradient>
-          <Text style={styles.subtitle}>
-            Brutal breakdown of size, symmetry & definition
-          </Text>
+          <Text style={styles.subtitle}>Brutal breakdown of size, symmetry & definition</Text>
         </View>
 
         {/* KEY METRICS */}
@@ -760,23 +741,15 @@ export default function PremiumResults() {
             <Metric label="SCORE" value={`${score ?? "—"}`} />
             <Metric
               label="BODY FAT"
-              value={
-                bodyfat !== undefined && bodyfat !== null ? `${bodyfat}%` : "—"
-              }
+              value={bodyfat !== undefined && bodyfat !== null ? `${bodyfat}%` : "—"}
             />
             <Metric
               label="SYMMETRY"
-              value={
-                symmetry !== undefined && symmetry !== null ? `${symmetry}%` : "—"
-              }
+              value={symmetry !== undefined && symmetry !== null ? `${symmetry}%` : "—"}
             />
             <Metric
               label="CONFIDENCE"
-              value={
-                confidence !== undefined && confidence !== null
-                  ? `${confidence}%`
-                  : "—"
-              }
+              value={confidence !== undefined && confidence !== null ? `${confidence}%` : "—"}
             />
           </View>
         </View>
@@ -795,14 +768,14 @@ export default function PremiumResults() {
           </View>
         </View>
 
-        {/* MUSCLE GROUP STRENGTH */}
+        {/* MUSCLE GROUPS */}
         <View style={styles.card}>
           <Text style={styles.sectionTitle}>Muscle Group Strength Map</Text>
           <Text style={styles.cardHint}>These scores judge pure size & structure.</Text>
 
           {MUSCLE_ORDER.map((muscle) =>
-            groups?.[muscle] !== undefined ? (
-              <StrengthBar key={muscle} label={muscle} value={groups[muscle] as number} />
+            (groups as any)?.[muscle] !== undefined ? (
+              <StrengthBar key={muscle} label={muscle} value={(groups as any)[muscle] as number} />
             ) : null
           )}
         </View>
@@ -813,8 +786,8 @@ export default function PremiumResults() {
           <Text style={styles.cardHint}>This is how sharp you look — not just size.</Text>
 
           {DEF_ORDER.map((key) =>
-            definition?.[key] !== undefined ? (
-              <StrengthBar key={key} label={key} value={definition[key] as number} />
+            (definition as any)?.[key] !== undefined ? (
+              <StrengthBar key={key} label={key} value={(definition as any)[key] as number} />
             ) : null
           )}
 
@@ -828,16 +801,12 @@ export default function PremiumResults() {
           )}
         </View>
 
-        {/* PROPORTION RATIOS */}
+        {/* RATIOS */}
         <View style={styles.card}>
           <Text style={styles.sectionTitle}>Proportion Ratios</Text>
 
           <View style={styles.ratioRow}>
-            <Ratio
-              label="Shoulder / Waist"
-              value={fmt(swr, 2)}
-              note={describeSWR(swr)}
-            />
+            <Ratio label="Shoulder / Waist" value={fmt(swr, 2)} note={describeSWR(swr)} />
             <Ratio label="Leg / Torso" value={fmt(ltr, 2)} note={describeLTR(ltr)} />
           </View>
 
@@ -851,7 +820,7 @@ export default function PremiumResults() {
           </View>
         </View>
 
-        {/* SAVE REPORT */}
+        {/* CTA: SAVE */}
         <TouchableOpacity
           style={styles.ctaOuter}
           onPress={saveReport}
@@ -863,7 +832,7 @@ export default function PremiumResults() {
           </LinearGradient>
         </TouchableOpacity>
 
-        {/* WORKOUT PLAN */}
+        {/* CTA: WORKOUT */}
         <TouchableOpacity
           style={styles.ctaOuter}
           onPress={handleGenerateWorkout}
@@ -871,9 +840,7 @@ export default function PremiumResults() {
           disabled={generating}
         >
           <LinearGradient colors={["#00E6C8", "#9AF65B"]} style={styles.ctaInner}>
-            <Text style={styles.ctaText}>
-              {generating ? "Generating…" : "View Workout Plan"}
-            </Text>
+            <Text style={styles.ctaText}>{generating ? "Generating…" : "View Workout Plan"}</Text>
           </LinearGradient>
         </TouchableOpacity>
 
@@ -883,12 +850,7 @@ export default function PremiumResults() {
           onPress={handleCancel}
           activeOpacity={0.8}
         >
-          <View
-            style={[
-              styles.ctaInner,
-              { backgroundColor: "#1A1D21", borderRadius: 14 },
-            ]}
-          >
+          <View style={[styles.ctaInner, { backgroundColor: "#1A1D21", borderRadius: 14 }]}>
             <Text style={[styles.ctaText, { color: "#C7D0D8" }]}>Cancel</Text>
           </View>
         </TouchableOpacity>
@@ -899,7 +861,7 @@ export default function PremiumResults() {
   );
 }
 
-/************************ COMPONENTS ************************/
+/* ------------------------ UI Components ------------------------ */
 
 function Metric({ label, value }: { label: string; value: string }) {
   return (
@@ -940,15 +902,7 @@ function StrengthBar({ label, value }: { label: string; value: number }) {
   );
 }
 
-function Ratio({
-  label,
-  value,
-  note,
-}: {
-  label: string;
-  value: string;
-  note: string;
-}) {
+function Ratio({ label, value, note }: { label: string; value: string; note: string }) {
   return (
     <View style={styles.ratioBox}>
       <Text style={styles.ratioLabel}>{label}</Text>
@@ -958,7 +912,7 @@ function Ratio({
   );
 }
 
-/************************ STYLES ************************/
+/* ------------------------ Styles ------------------------ */
 
 const styles = StyleSheet.create({
   loadingScreen: {
@@ -966,15 +920,27 @@ const styles = StyleSheet.create({
     backgroundColor: "#0B0D0F",
     justifyContent: "center",
     alignItems: "center",
+    paddingHorizontal: 20,
   },
-  safeArea: {
-    flex: 1,
-    backgroundColor: "#0B0D0F",
+  loadingText: { color: "white", marginTop: 10, fontWeight: "800" },
+  loadingSub: { color: "#7D8A90", marginTop: 6, textAlign: "center", lineHeight: 18 },
+
+  errorTitle: { color: "white", fontSize: 18, fontWeight: "900", textAlign: "center" },
+  errorBody: { color: "#A8B4B9", marginTop: 10, textAlign: "center", lineHeight: 18 },
+
+  retryBtn: { borderRadius: 14, paddingVertical: 14, paddingHorizontal: 22 },
+  retryText: { color: "#0B0D0F", fontWeight: "900" },
+
+  emptyText: {
+    color: "white",
+    textAlign: "center",
+    paddingHorizontal: 20,
+    lineHeight: 20,
   },
-  pageContent: {
-    paddingHorizontal: GUTTER,
-    paddingBottom: 30,
-  },
+
+  safeArea: { flex: 1, backgroundColor: "#0B0D0F" },
+  pageContent: { paddingHorizontal: GUTTER, paddingBottom: 30 },
+
   headerRow: {
     marginTop: Platform.OS === "android" ? 10 : 0,
     marginBottom: 12,
@@ -989,78 +955,24 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-  logoText: {
-    color: "#0B0D0F",
-    fontWeight: "800",
-    fontSize: 18,
-  },
-  headerDate: {
-    color: "#9AF65B",
-    fontSize: 14,
-  },
-  titleSection: {
-    marginBottom: 12,
-    alignItems: "center",
-  },
-  titleCard: {
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    borderRadius: 12,
-  },
-  titleText: {
-    color: "#0B0D0F",
-    fontWeight: "800",
-    fontSize: 20,
-  },
-  subtitle: {
-    marginTop: 8,
-    color: "#8DA6A8",
-    fontSize: 14,
-    textAlign: "center",
-  },
-  card: {
-    backgroundColor: "#111417",
-    borderRadius: 18,
-    padding: 16,
-    marginTop: 16,
-  },
-  sectionTitle: {
-    fontSize: 20,
-    fontWeight: "700",
-    color: "#C8FFD6",
-    marginBottom: 10,
-  },
-  cardHint: {
-    color: "#7D8A90",
-    fontSize: 12,
-    marginBottom: 10,
-  },
-  metricsGrid: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: 12,
-  },
-  metricBox: {
-    width: "48%",
-    backgroundColor: "#0E1215",
-    borderRadius: 16,
-    padding: 14,
-  },
-  metricLabel: {
-    color: "#83CDB7",
-    fontSize: 12,
-  },
-  metricValue: {
-    color: "#FFF",
-    fontSize: 26,
-    fontWeight: "700",
-  },
-  typeCard: {
-    backgroundColor: "#0E1215",
-    borderRadius: 16,
-    padding: 16,
-    alignItems: "center",
-  },
+  logoText: { color: "#0B0D0F", fontWeight: "800", fontSize: 18 },
+  headerDate: { color: "#9AF65B", fontSize: 14 },
+
+  titleSection: { marginBottom: 12, alignItems: "center" },
+  titleCard: { paddingHorizontal: 16, paddingVertical: 10, borderRadius: 12 },
+  titleText: { color: "#0B0D0F", fontWeight: "800", fontSize: 20 },
+  subtitle: { marginTop: 8, color: "#8DA6A8", fontSize: 14, textAlign: "center" },
+
+  card: { backgroundColor: "#111417", borderRadius: 18, padding: 16, marginTop: 16 },
+  sectionTitle: { fontSize: 20, fontWeight: "700", color: "#C8FFD6", marginBottom: 10 },
+  cardHint: { color: "#7D8A90", fontSize: 12, marginBottom: 10 },
+
+  metricsGrid: { flexDirection: "row", flexWrap: "wrap", gap: 12 },
+  metricBox: { width: "48%", backgroundColor: "#0E1215", borderRadius: 16, padding: 14 },
+  metricLabel: { color: "#83CDB7", fontSize: 12 },
+  metricValue: { color: "#FFF", fontSize: 26, fontWeight: "700" },
+
+  typeCard: { backgroundColor: "#0E1215", borderRadius: 16, padding: 16, alignItems: "center" },
   typeIcon: {
     width: 80,
     height: 80,
@@ -1069,85 +981,26 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     marginBottom: 10,
   },
-  typeIconGlyph: {
-    fontSize: 36,
-    color: "#0B0D0F",
-  },
-  typeName: {
-    color: "#FFF",
-    fontSize: 22,
-    fontWeight: "800",
-    marginBottom: 6,
-  },
-  typeDesc: {
-    color: "#A8B4B9",
-    textAlign: "center",
-    lineHeight: 20,
-  },
-  strRow: {
-    marginBottom: 12,
-  },
-  strLabel: {
-    color: "#E9F6F0",
-    marginBottom: 6,
-    fontSize: 16,
-    textTransform: "capitalize",
-  },
-  strBarTrack: {
-    height: 12,
-    borderRadius: 8,
-    backgroundColor: "#1B2125",
-    overflow: "hidden",
-  },
-  strBarFill: {
-    height: 12,
-    borderRadius: 8,
-  },
-  strValue: {
-    color: "#9AF65B",
-    marginTop: 4,
-  },
-  ratioRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    marginTop: 10,
-  },
-  ratioBox: {
-    width: "48%",
-    backgroundColor: "#0E1215",
-    borderRadius: 14,
-    padding: 12,
-  },
-  ratioLabel: {
-    color: "#9AB8BE",
-    fontSize: 12,
-    marginBottom: 4,
-  },
-  ratioValue: {
-    color: "#FFF",
-    fontSize: 18,
-    fontWeight: "700",
-    marginBottom: 4,
-  },
-  ratioNote: {
-    color: "#8FA0A8",
-    fontSize: 11,
-    lineHeight: 16,
-  },
-  ctaOuter: {
-    marginTop: 16,
-  },
-  ctaInner: {
-    borderRadius: 14,
-    paddingVertical: 16,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  ctaText: {
-    color: "#0B0D0F",
-    fontWeight: "800",
-    fontSize: 16,
-  },
+  typeIconGlyph: { fontSize: 36, color: "#0B0D0F" },
+  typeName: { color: "#FFF", fontSize: 22, fontWeight: "800", marginBottom: 6 },
+  typeDesc: { color: "#A8B4B9", textAlign: "center", lineHeight: 20 },
+
+  strRow: { marginBottom: 12 },
+  strLabel: { color: "#E9F6F0", marginBottom: 6, fontSize: 16, textTransform: "capitalize" },
+  strBarTrack: { height: 12, borderRadius: 8, backgroundColor: "#1B2125", overflow: "hidden" },
+  strBarFill: { height: 12, borderRadius: 8 },
+  strValue: { color: "#9AF65B", marginTop: 4 },
+
+  ratioRow: { flexDirection: "row", justifyContent: "space-between", marginTop: 10 },
+  ratioBox: { width: "48%", backgroundColor: "#0E1215", borderRadius: 14, padding: 12 },
+  ratioLabel: { color: "#9AB8BE", fontSize: 12, marginBottom: 4 },
+  ratioValue: { color: "#FFF", fontSize: 18, fontWeight: "700", marginBottom: 4 },
+  ratioNote: { color: "#8FA0A8", fontSize: 11, lineHeight: 16 },
+
+  ctaOuter: { marginTop: 16 },
+  ctaInner: { borderRadius: 14, paddingVertical: 16, alignItems: "center", justifyContent: "center" },
+  ctaText: { color: "#0B0D0F", fontWeight: "800", fontSize: 16 },
+
   definitionNotesBox: {
     marginTop: 12,
     padding: 12,
@@ -1156,15 +1009,6 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#1F2A33",
   },
-  definitionNotesLabel: {
-    color: "#9AF65B",
-    fontSize: 13,
-    fontWeight: "700",
-    marginBottom: 4,
-  },
-  definitionNotesText: {
-    color: "#DDE6EA",
-    fontSize: 13,
-    lineHeight: 18,
-  },
+  definitionNotesLabel: { color: "#9AF65B", fontSize: 13, fontWeight: "700", marginBottom: 4 },
+  definitionNotesText: { color: "#DDE6EA", fontSize: 13, lineHeight: 18 },
 });

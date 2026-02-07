@@ -19,16 +19,14 @@ import { ensureProfile } from "../lib/profile";
 import { useAuthStore } from "../store/useAuthStore";
 
 /**
- * App-side gating normalization:
- * - "premium" / "pro" / "paid" => pro
- * - "trial" => pro (CHANGE HERE if you want trial to be treated as free)
- * - everything else => free
+ * New plan model (authoritative):
+ * - profiles.plan_normalized: "free" | "pro"
+ * - signup ALWAYS starts as "free"
+ * - RevenueCat later upgrades → syncEntitlementsToSupabase()
  */
-function normalizePlan(plan: any): "free" | "pro" {
-  const v = String(plan ?? "").trim().toLowerCase();
-  if (v === "trial") return "pro";
-  if (v === "premium" || v === "pro" || v === "paid") return "pro";
-  return "free";
+function normalizePlanNormalized(v: any): "free" | "pro" {
+  const s = String(v ?? "").trim().toLowerCase();
+  return s === "pro" ? "pro" : "free";
 }
 
 export default function SignUp() {
@@ -47,16 +45,17 @@ export default function SignUp() {
     const userTrim = username.trim();
 
     if (!userTrim || !emailTrim || !pw.trim()) {
-      return Alert.alert(
+      Alert.alert(
         "Missing info",
         "Please fill in username, email, and password."
       );
+      return;
     }
 
     setLoading(true);
 
     try {
-      // 🔐 Create user in Supabase Auth (password is stored/verified by Supabase Auth, not your DB)
+      // 1️⃣ Create Supabase Auth user
       const { data, error } = await supabase.auth.signUp({
         email: emailTrim,
         password: pw,
@@ -67,10 +66,9 @@ export default function SignUp() {
         return;
       }
 
-      // NOTE: Depending on your Supabase Auth settings (email confirmation),
-      // data.user may exist but there may be no session yet.
       const user = data.user;
 
+      // Email confirmation ON → no session yet
       if (!user?.id) {
         Alert.alert(
           "Check your email",
@@ -80,34 +78,29 @@ export default function SignUp() {
         return;
       }
 
-      // ✅ Ensure profile row exists (creates if missing)
+      // 2️⃣ Ensure profiles row exists (creates default free row)
       await ensureProfile(user.id, user.email ?? emailTrim, userTrim);
 
-      // ✅ Fetch profile plan (avoid .single() crash cases)
+      // 3️⃣ Fetch canonical plan fields ONLY
       const { data: profile, error: profileErr } = await supabase
         .from("profiles")
-        .select("user_id, email, plan, is_premium, trial_active, premium_until")
+        .select("user_id, email, plan_normalized, plan_raw")
         .eq("user_id", user.id)
         .maybeSingle();
 
       if (profileErr) {
         console.log("❌ Profile fetch failed after signup:", profileErr);
-        Alert.alert("Error", "Profile created, but failed to load it. Please log in.");
+        Alert.alert(
+          "Error",
+          "Profile created, but failed to load it. Please log in."
+        );
         router.replace("/login");
         return;
       }
 
-      // Prefer explicit plan; otherwise fall back to flags
-      let planRaw = profile?.plan;
-      if (!planRaw) {
-        const isPremium = !!profile?.is_premium;
-        const trialActive = !!profile?.trial_active;
-        planRaw = isPremium ? "premium" : trialActive ? "trial" : "free";
-      }
+      const normalized = normalizePlanNormalized(profile?.plan_normalized);
 
-      const normalized = normalizePlan(planRaw);
-
-      // ✅ Sync Zustand auth store (matches your current useAuthStore.ts)
+      // 4️⃣ Hydrate auth store
       setIdentity({
         userId: user.id,
         email: user.email ?? profile?.email ?? emailTrim,
@@ -116,11 +109,11 @@ export default function SignUp() {
 
       console.log("✅ Signed up:", {
         email: user.email,
-        plan_raw: planRaw,
         plan_normalized: normalized,
+        plan_raw: profile?.plan_raw ?? "free",
       });
 
-      // ✔ Send into your main flow
+      // 5️⃣ Continue to app
       router.replace("/(tabs)/analyze");
     } catch (e: any) {
       console.log("❌ Signup crash:", e);
@@ -194,7 +187,7 @@ export default function SignUp() {
               style={[styles.cta, loading && { opacity: 0.6 }]}
             >
               <Text style={styles.ctaText}>
-                {loading ? "Creating..." : "Create Account"}
+                {loading ? "Creating…" : "Create Account"}
               </Text>
             </LinearGradient>
           </TouchableOpacity>
@@ -219,6 +212,7 @@ const styles = StyleSheet.create({
   container: { flex: 1, padding: 20, justifyContent: "center" },
   header: { color: "#fff", fontSize: 26, fontWeight: "700" },
   sub: { color: "#B3B3B3", marginTop: 6, marginBottom: 16 },
+
   inputGroup: { marginBottom: 12 },
   label: { color: "#FFFFFF", marginBottom: 6, fontWeight: "600" },
   input: {
@@ -230,6 +224,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingVertical: 12,
   },
+
   cta: {
     borderRadius: 999,
     paddingVertical: 14,
@@ -237,5 +232,6 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   ctaText: { color: "#0F0F0F", fontWeight: "700", fontSize: 16 },
+
   linkText: { color: "#FFFFFF", textAlign: "center", fontWeight: "600" },
 });

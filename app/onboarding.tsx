@@ -1,7 +1,9 @@
 // app/onboarding.tsx
 // #onboarding
 // ---------------------------------------------
-// 9-Step Onboarding (with incremental saving)
+// 9-Step Onboarding (public, works signed-out)
+// - Saves progress locally (AsyncStorage)
+// - If logged in, also syncs into Supabase profiles
 // Order:
 // 0 Gender & Age
 // 1 Body Metrics (Height / Weight)
@@ -14,7 +16,7 @@
 // 8 Pre-Scan Hype + Begin Capture
 // ---------------------------------------------
 
-import React, { useState, useEffect } from "react";
+import React, { useState } from "react";
 import {
   View,
   Text,
@@ -26,6 +28,7 @@ import { useRouter } from "expo-router";
 import { LinearGradient } from "expo-linear-gradient";
 import { Picker } from "@react-native-picker/picker";
 import { Ionicons } from "@expo/vector-icons";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 
 import { supabase } from "../lib/supabase";
 import { useAuthStore } from "../store/useAuthStore";
@@ -33,20 +36,20 @@ import { useAuthStore } from "../store/useAuthStore";
 const gradient = ["#00f5a0", "#00d9f5"];
 const SCREEN_WIDTH = Dimensions.get("window").width;
 
+const ONBOARDING_DRAFT_KEY = "onboarding_draft_v1";
+
 export default function Onboarding() {
   const router = useRouter();
 
-  // Auth
-  const { userId } = useAuthStore();
-  const hasHydrated = useAuthStore.persist.hasHydrated();
+  // Auth (optional). Onboarding is PUBLIC.
+  const userId = useAuthStore((s) => s.userId);
 
   // ───────────────────────────────────────
   // STATE
   // ───────────────────────────────────────
   const [step, setStep] = useState(0);
 
-  const [gender, setGender] =
-    useState<"Male" | "Female" | "Other">("Male");
+  const [gender, setGender] = useState<"Male" | "Female" | "Other">("Male");
   const [age, setAge] = useState(25);
 
   // Unit system toggle (false = imperial, true = metric)
@@ -63,38 +66,18 @@ export default function Onboarding() {
   const [painPoints, setPainPoints] = useState<string[]>([]);
   const [goal, setGoal] = useState("Gain Muscle");
 
-  const [equipment, setEquipment] = useState<
-    "Gym" | "Bodyweight" | "Hybrid"
-  >("Gym");
+  const [equipment, setEquipment] = useState<"Gym" | "Bodyweight" | "Hybrid">(
+    "Gym"
+  );
 
   const [activity, setActivity] = useState("Moderate");
   const [experience, setExperience] = useState("Beginner");
 
-  const [toneMode, setToneMode] =
-    useState<"Savage" | "Pro" | "Adaptive">("Savage");
+  const [toneMode, setToneMode] = useState<"Savage" | "Pro" | "Adaptive">(
+    "Savage"
+  );
 
   const totalSteps = 9;
-
-  // ───────────────────────────────────────
-  // AUTH GUARD
-  // ───────────────────────────────────────
-  useEffect(() => {
-    if (!hasHydrated) return;
-    if (!userId) {
-      router.replace("/login");
-    }
-  }, [hasHydrated, userId, router]);
-
-  if (!hasHydrated) {
-    return (
-      <LinearGradient
-        colors={["#050505", "#0a0a0a"]}
-        style={{ flex: 1, justifyContent: "center", alignItems: "center" }}
-      >
-        <Text style={{ color: "white" }}>Loading…</Text>
-      </LinearGradient>
-    );
-  }
 
   // ───────────────────────────────────────
   // HELPERS
@@ -104,11 +87,7 @@ export default function Onboarding() {
   const back = () => setStep((s) => Math.max(s - 1, 0));
 
   const togglePainPoint = (p: string) => {
-    setPainPoints((prev) =>
-      prev.includes(p)
-        ? prev.filter((x) => x !== p)
-        : [...prev, p]
-    );
+    setPainPoints((prev) => (prev.includes(p) ? prev.filter((x) => x !== p) : [...prev, p]));
   };
 
   const imperialToCm = (ft: number, inch: number) => {
@@ -116,67 +95,79 @@ export default function Onboarding() {
     return Math.round(totalInches * 2.54);
   };
 
-  const lbToKg = (lb: number) => {
-    return Math.round(lb * 0.453592);
+  const lbToKg = (lb: number) => Math.round(lb * 0.453592);
+
+  const buildPayload = () => {
+    const unit_system = metric ? "metric" : "imperial";
+
+    const height_cm = metric ? cm : imperialToCm(height.ft, height.inch);
+    const weight_kg = metric ? kg : lbToKg(weight);
+
+    return {
+      gender,
+      age,
+      unit_system,
+      height_cm,
+      weight_kg,
+      goal,
+      pain_points: painPoints,
+      equipment,
+      activity_level: activity,
+      experience_level: experience,
+      tone_mode: toneMode,
+      updated_at: new Date().toISOString(),
+      // useful to know how far they got:
+      onboarding_step: step,
+      onboarding_complete: step >= totalSteps - 1,
+    };
   };
 
-  // Incremental save into Supabase.profiles on each step
-  const saveProfileProgress = async () => {
+  // Save locally always, and sync to Supabase only if logged in
+  const saveProgress = async () => {
+    const payload = buildPayload();
+
+    // 1) Local draft (works signed-out)
+    try {
+      await AsyncStorage.setItem(ONBOARDING_DRAFT_KEY, JSON.stringify(payload));
+      console.log("✅ Onboarding draft saved locally:", payload);
+    } catch (e) {
+      console.log("❌ Onboarding local save failed:", e);
+    }
+
+    // 2) Supabase sync (only if we have a user)
     if (!userId) return;
 
     try {
-      const unit_system = metric ? "metric" : "imperial";
-
-      const height_cm = metric
-        ? cm
-        : imperialToCm(height.ft, height.inch);
-
-      const weight_kg = metric ? kg : lbToKg(weight);
-
-      const payload: Record<string, any> = {
-        gender,
-        age,
-        unit_system,
-        height_cm,
-        weight_kg,
-        goal,
-        pain_points: painPoints,
-        equipment,
-        activity_level: activity,
-        experience_level: experience,
-        tone_mode: toneMode,
-        updated_at: new Date().toISOString(),
-      };
-
       const { error } = await supabase
         .from("profiles")
         .update(payload)
         .eq("user_id", userId);
 
-      if (error) {
-        console.log("❌ Onboarding save error:", error);
-      } else {
-        console.log("✅ Onboarding progress saved:", payload);
-      }
-    } catch (err) {
-      console.log("❌ Onboarding save exception:", err);
+      if (error) console.log("❌ Onboarding Supabase save error:", error);
+      else console.log("✅ Onboarding synced to Supabase.");
+    } catch (e) {
+      console.log("❌ Onboarding Supabase save exception:", e);
     }
   };
 
   const handleContinue = async () => {
-    await saveProfileProgress();
+    await saveProgress();
     next();
   };
 
   const handleFinish = async () => {
-    await saveProfileProgress();
-    router.push("/capture");
+    await saveProgress();
+    router.push({
+      pathname: "/capture",
+      params: { photoIndex: 0 },
+    });
   };
 
   // ───────────────────────────────────────────────
   // COMPONENT HELPERS
   // ───────────────────────────────────────────────
-  const Continue = ({ onPress }: { onPress: () => void }) => (
+
+  const Continue = ({ onPress, label = "Continue" }: { onPress: () => void; label?: string }) => (
     <TouchableOpacity onPress={onPress} style={{ marginTop: 34 }}>
       <LinearGradient
         colors={gradient}
@@ -193,7 +184,7 @@ export default function Onboarding() {
             fontSize: 18,
           }}
         >
-          Continue
+          {label}
         </Text>
       </LinearGradient>
     </TouchableOpacity>
@@ -247,8 +238,7 @@ export default function Onboarding() {
                 height: 6,
                 borderRadius: 10,
                 marginHorizontal: 4,
-                backgroundColor:
-                  i <= step ? "#7CFFB2" : "#1E1E1E",
+                backgroundColor: i <= step ? "#7CFFB2" : "#1E1E1E",
               }}
             />
           ))}
@@ -258,9 +248,7 @@ export default function Onboarding() {
         {step === 0 && (
           <View>
             <SectionTitle>Tell us about yourself</SectionTitle>
-            <Subtitle>
-              This helps personalize your physique analysis.
-            </Subtitle>
+            <Subtitle>This helps personalize your physique analysis.</Subtitle>
 
             {/* Gender */}
             <Text
@@ -290,9 +278,7 @@ export default function Onboarding() {
                     style={{
                       flex: 1,
                       marginHorizontal: 5,
-                      backgroundColor: selected
-                        ? "#00f5a0"
-                        : "#121212",
+                      backgroundColor: selected ? "#00f5a0" : "#121212",
                       paddingVertical: 18,
                       borderRadius: 12,
                       alignItems: "center",
@@ -304,18 +290,14 @@ export default function Onboarding() {
                         fontWeight: "600",
                       }}
                     >
-                      {g === "Male"
-                        ? "👨‍🦱 Male"
-                        : g === "Female"
-                        ? "👩‍🦰 Female"
-                        : "⚧️ Other"}
+                      {g === "Male" ? "👨‍🦱 Male" : g === "Female" ? "👩‍🦰 Female" : "⚧️ Other"}
                     </Text>
                   </TouchableOpacity>
                 );
               })}
             </View>
 
-            {/* Age – wheel picker style */}
+            {/* Age */}
             <Text
               style={{
                 color: "white",
@@ -327,9 +309,7 @@ export default function Onboarding() {
               Age
             </Text>
 
-            <View
-              style={{ alignItems: "center", marginBottom: 8 }}
-            >
+            <View style={{ alignItems: "center", marginBottom: 8 }}>
               <Text
                 style={{
                   color: "#7CFFB2",
@@ -351,28 +331,20 @@ export default function Onboarding() {
               }}
               onValueChange={(v) => setAge(v)}
             >
-              {Array.from({ length: 88 }, (_, i) => i + 13).map(
-                (v) => (
-                  <Picker.Item
-                    key={v}
-                    label={`${v}`}
-                    value={v}
-                  />
-                )
-              )}
+              {Array.from({ length: 88 }, (_, i) => i + 13).map((v) => (
+                <Picker.Item key={v} label={`${v}`} value={v} />
+              ))}
             </Picker>
 
             <Continue onPress={handleContinue} />
           </View>
         )}
 
-        {/* STEP 1 — Body Metrics: Height & Weight */}
+        {/* STEP 1 — Body Metrics */}
         {step === 1 && (
           <View>
             <SectionTitle>Height & weight</SectionTitle>
-            <Subtitle>
-              This will be used to calibrate your custom plan.
-            </Subtitle>
+            <Subtitle>This will be used to calibrate your custom plan.</Subtitle>
 
             {/* Unit toggle */}
             <View
@@ -402,9 +374,7 @@ export default function Onboarding() {
                   borderRadius: 20,
                   backgroundColor: metric ? "#00f5a0" : "#444",
                   padding: 3,
-                  justifyContent: metric
-                    ? "flex-end"
-                    : "flex-start",
+                  justifyContent: metric ? "flex-end" : "flex-start",
                 }}
               >
                 <View
@@ -429,7 +399,6 @@ export default function Onboarding() {
               </Text>
             </View>
 
-            {/* Pickers row */}
             <View
               style={{
                 flexDirection: "row",
@@ -439,79 +408,40 @@ export default function Onboarding() {
             >
               {/* HEIGHT */}
               <View style={{ flex: 1, alignItems: "center" }}>
-                <Text
-                  style={{
-                    color: "white",
-                    fontSize: 16,
-                    fontWeight: "600",
-                  }}
-                >
+                <Text style={{ color: "white", fontSize: 16, fontWeight: "600" }}>
                   Height
                 </Text>
 
                 {!metric ? (
                   <View style={{ flexDirection: "row" }}>
-                    {/* Feet */}
                     <Picker
                       selectedValue={height.ft}
-                      style={{
-                        width: 100,
-                        color: "white",
-                        height: 180,
-                      }}
-                      onValueChange={(v) =>
-                        setHeight((p) => ({ ...p, ft: v }))
-                      }
+                      style={{ width: 100, color: "white", height: 180 }}
+                      onValueChange={(v) => setHeight((p) => ({ ...p, ft: v }))}
                     >
                       {[4, 5, 6, 7].map((ft) => (
-                        <Picker.Item
-                          key={ft}
-                          label={`${ft} ft`}
-                          value={ft}
-                        />
+                        <Picker.Item key={ft} label={`${ft} ft`} value={ft} />
                       ))}
                     </Picker>
 
-                    {/* Inches */}
                     <Picker
                       selectedValue={height.inch}
-                      style={{
-                        width: 100,
-                        color: "white",
-                        height: 180,
-                      }}
-                      onValueChange={(v) =>
-                        setHeight((p) => ({ ...p, inch: v }))
-                      }
+                      style={{ width: 100, color: "white", height: 180 }}
+                      onValueChange={(v) => setHeight((p) => ({ ...p, inch: v }))}
                     >
                       {Array.from({ length: 12 }).map((_, i) => (
-                        <Picker.Item
-                          key={i}
-                          label={`${i} in`}
-                          value={i}
-                        />
+                        <Picker.Item key={i} label={`${i} in`} value={i} />
                       ))}
                     </Picker>
                   </View>
                 ) : (
                   <Picker
                     selectedValue={cm}
-                    style={{
-                      width: 120,
-                      color: "white",
-                      height: 180,
-                    }}
+                    style={{ width: 120, color: "white", height: 180 }}
                     onValueChange={(v) => setCm(v)}
                   >
-                    {Array.from(
-                      { length: 160 },
-                      (_, i) => i + 140
-                    ).map((v) => (
-                      <Picker.Item
-                        key={v}
-                        label={`${v} cm`}
-                        value={v}
-                      />
+                    {Array.from({ length: 160 }, (_, i) => i + 140).map((v) => (
+                      <Picker.Item key={v} label={`${v} cm`} value={v} />
                     ))}
                   </Picker>
                 )}
@@ -519,56 +449,28 @@ export default function Onboarding() {
 
               {/* WEIGHT */}
               <View style={{ flex: 1, alignItems: "center" }}>
-                <Text
-                  style={{
-                    color: "white",
-                    fontSize: 16,
-                    fontWeight: "600",
-                  }}
-                >
+                <Text style={{ color: "white", fontSize: 16, fontWeight: "600" }}>
                   Weight
                 </Text>
 
                 {!metric ? (
                   <Picker
                     selectedValue={weight}
-                    style={{
-                      width: 120,
-                      color: "white",
-                      height: 180,
-                    }}
+                    style={{ width: 120, color: "white", height: 180 }}
                     onValueChange={(v) => setWeight(v)}
                   >
-                    {Array.from(
-                      { length: 400 },
-                      (_, i) => i + 70
-                    ).map((v) => (
-                      <Picker.Item
-                        key={v}
-                        label={`${v} lb`}
-                        value={v}
-                      />
+                    {Array.from({ length: 400 }, (_, i) => i + 70).map((v) => (
+                      <Picker.Item key={v} label={`${v} lb`} value={v} />
                     ))}
                   </Picker>
                 ) : (
                   <Picker
                     selectedValue={kg}
-                    style={{
-                      width: 120,
-                      color: "white",
-                      height: 180,
-                    }}
+                    style={{ width: 120, color: "white", height: 180 }}
                     onValueChange={(v) => setKg(v)}
                   >
-                    {Array.from(
-                      { length: 300 },
-                      (_, i) => i + 30
-                    ).map((v) => (
-                      <Picker.Item
-                        key={v}
-                        label={`${v} kg`}
-                        value={v}
-                      />
+                    {Array.from({ length: 300 }, (_, i) => i + 30).map((v) => (
+                      <Picker.Item key={v} label={`${v} kg`} value={v} />
                     ))}
                   </Picker>
                 )}
@@ -583,10 +485,7 @@ export default function Onboarding() {
         {step === 2 && (
           <View>
             <SectionTitle>What’s holding you back?</SectionTitle>
-            <Subtitle>
-              Choose all that apply — this helps target your weak
-              points.
-            </Subtitle>
+            <Subtitle>Choose all that apply — this helps target your weak points.</Subtitle>
 
             {[
               "I can’t tell what looks off in my physique",
@@ -602,20 +501,13 @@ export default function Onboarding() {
                   key={p}
                   onPress={() => togglePainPoint(p)}
                   style={{
-                    backgroundColor: selected
-                      ? "#00f5a0"
-                      : "#121212",
+                    backgroundColor: selected ? "#00f5a0" : "#121212",
                     padding: 16,
                     borderRadius: 14,
                     marginBottom: 12,
                   }}
                 >
-                  <Text
-                    style={{
-                      color: selected ? "black" : "white",
-                      fontWeight: "600",
-                    }}
-                  >
+                  <Text style={{ color: selected ? "black" : "white", fontWeight: "600" }}>
                     {p}
                   </Text>
                 </TouchableOpacity>
@@ -630,9 +522,7 @@ export default function Onboarding() {
         {step === 3 && (
           <View>
             <SectionTitle>Your goals</SectionTitle>
-            <Subtitle>
-              Your breakdown will be tuned for your goal.
-            </Subtitle>
+            <Subtitle>Your breakdown will be tuned for your goal.</Subtitle>
 
             {[
               { name: "Gain Muscle", icon: "💪" },
@@ -645,9 +535,7 @@ export default function Onboarding() {
                   key={g.name}
                   onPress={() => setGoal(g.name)}
                   style={{
-                    backgroundColor: selected
-                      ? "#00f5a0"
-                      : "#121212",
+                    backgroundColor: selected ? "#00f5a0" : "#121212",
                     padding: 18,
                     borderRadius: 14,
                     marginBottom: 16,
@@ -670,60 +558,33 @@ export default function Onboarding() {
           </View>
         )}
 
-        {/* STEP 4 — Equipment Preference */}
+        {/* STEP 4 — Equipment */}
         {step === 4 && (
           <View>
             <SectionTitle>Equipment preference</SectionTitle>
-            <Subtitle>
-              Your workout plan will be built around what you can
-              actually train with.
-            </Subtitle>
+            <Subtitle>Your workout plan will be built around what you can actually train with.</Subtitle>
 
             {[
-              {
-                key: "Gym",
-                desc: "Full gym: machines, cables, barbells, dumbbells.",
-              },
-              {
-                key: "Bodyweight",
-                desc: "Home training, minimal or no equipment.",
-              },
-              {
-                key: "Hybrid",
-                desc: "Some weights + home training.",
-              },
+              { key: "Gym", desc: "Full gym: machines, cables, barbells, dumbbells." },
+              { key: "Bodyweight", desc: "Home training, minimal or no equipment." },
+              { key: "Hybrid", desc: "Some weights + home training." },
             ].map((item) => {
               const selected = equipment === item.key;
               return (
                 <TouchableOpacity
                   key={item.key}
-                  onPress={() =>
-                    setEquipment(item.key as any)
-                  }
+                  onPress={() => setEquipment(item.key as any)}
                   style={{
-                    backgroundColor: selected
-                      ? "#00f5a0"
-                      : "#121212",
+                    backgroundColor: selected ? "#00f5a0" : "#121212",
                     padding: 18,
                     borderRadius: 14,
                     marginBottom: 16,
                   }}
                 >
-                  <Text
-                    style={{
-                      fontSize: 18,
-                      color: selected ? "black" : "white",
-                      fontWeight: "700",
-                    }}
-                  >
+                  <Text style={{ fontSize: 18, color: selected ? "black" : "white", fontWeight: "700" }}>
                     {item.key}
                   </Text>
-                  <Text
-                    style={{
-                      color: selected ? "#222" : "#aaa",
-                      marginTop: 6,
-                    }}
-                  >
+                  <Text style={{ color: selected ? "#222" : "#aaa", marginTop: 6 }}>
                     {item.desc}
                   </Text>
                 </TouchableOpacity>
@@ -738,18 +599,9 @@ export default function Onboarding() {
         {step === 5 && (
           <View>
             <SectionTitle>Activity & experience</SectionTitle>
-            <Subtitle>
-              Helps calibrate your recommendations and training load.
-            </Subtitle>
+            <Subtitle>Helps calibrate your recommendations and training load.</Subtitle>
 
-            {/* Activity */}
-            <Text
-              style={{
-                color: "white",
-                fontWeight: "600",
-                marginBottom: 10,
-              }}
-            >
+            <Text style={{ color: "white", fontWeight: "600", marginBottom: 10 }}>
               Activity level
             </Text>
 
@@ -761,14 +613,7 @@ export default function Onboarding() {
                 marginBottom: 30,
               }}
             >
-              {[
-                "Sedentary",
-                "Light",
-                "Moderate",
-                "Active",
-                "Very Active",
-                "Athlete",
-              ].map((lvl) => {
+              {["Sedentary", "Light", "Moderate", "Active", "Very Active", "Athlete"].map((lvl) => {
                 const selected = activity === lvl;
                 return (
                   <TouchableOpacity
@@ -776,44 +621,24 @@ export default function Onboarding() {
                     onPress={() => setActivity(lvl)}
                     style={{
                       flexBasis: "48%",
-                      backgroundColor: selected
-                        ? "#00f5a0"
-                        : "#121212",
+                      backgroundColor: selected ? "#00f5a0" : "#121212",
                       paddingVertical: 16,
                       borderRadius: 12,
                       alignItems: "center",
                       marginVertical: 6,
                     }}
                   >
-                    <Text
-                      style={{
-                        color: selected ? "black" : "white",
-                      }}
-                    >
-                      {lvl}
-                    </Text>
+                    <Text style={{ color: selected ? "black" : "white" }}>{lvl}</Text>
                   </TouchableOpacity>
                 );
               })}
             </View>
 
-            {/* Experience */}
-            <Text
-              style={{
-                color: "white",
-                fontWeight: "600",
-                marginBottom: 10,
-              }}
-            >
+            <Text style={{ color: "white", fontWeight: "600", marginBottom: 10 }}>
               Training experience
             </Text>
 
-            <View
-              style={{
-                flexDirection: "row",
-                justifyContent: "space-between",
-              }}
-            >
+            <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
               {["Beginner", "Intermediate", "Advanced"].map((lvl) => {
                 const selected = experience === lvl;
                 return (
@@ -823,20 +648,13 @@ export default function Onboarding() {
                     style={{
                       flex: 1,
                       marginHorizontal: 5,
-                      backgroundColor: selected
-                        ? "#00f5a0"
-                        : "#121212",
+                      backgroundColor: selected ? "#00f5a0" : "#121212",
                       paddingVertical: 16,
                       borderRadius: 12,
                       alignItems: "center",
                     }}
                   >
-                    <Text
-                      style={{
-                        color: selected ? "black" : "white",
-                        fontWeight: "600",
-                      }}
-                    >
+                    <Text style={{ color: selected ? "black" : "white", fontWeight: "600" }}>
                       {lvl}
                     </Text>
                   </TouchableOpacity>
@@ -858,20 +676,17 @@ export default function Onboarding() {
               {
                 key: "Savage" as const,
                 title: "Savage Mode 😈",
-                subtitle:
-                  "Blunt, gym-bro honesty. Funny but still useful.",
+                subtitle: "Blunt, gym-bro honesty. Funny but still useful.",
               },
               {
                 key: "Pro" as const,
                 title: "Pro Coach Mode 🎯",
-                subtitle:
-                  "Serious, structured, coach-style feedback.",
+                subtitle: "Serious, structured, coach-style feedback.",
               },
               {
                 key: "Adaptive" as const,
                 title: "Adaptive Mode 🔄",
-                subtitle:
-                  "Let the AI adjust tone based on your behavior.",
+                subtitle: "Let the AI adjust tone based on your behavior.",
               },
             ].map((opt) => {
               const selected = toneMode === opt.key;
@@ -886,21 +701,10 @@ export default function Onboarding() {
                     marginBottom: 16,
                   }}
                 >
-                  <Text
-                    style={{
-                      fontSize: 18,
-                      color: selected ? "black" : "white",
-                      fontWeight: "700",
-                    }}
-                  >
+                  <Text style={{ fontSize: 18, color: selected ? "black" : "white", fontWeight: "700" }}>
                     {opt.title}
                   </Text>
-                  <Text
-                    style={{
-                      color: selected ? "#222" : "#aaa",
-                      marginTop: 6,
-                    }}
-                  >
+                  <Text style={{ color: selected ? "#222" : "#aaa", marginTop: 6 }}>
                     {opt.subtitle}
                   </Text>
                 </TouchableOpacity>
@@ -914,18 +718,14 @@ export default function Onboarding() {
         {/* STEP 7 — Clothing & Guidelines */}
         {step === 7 && (
           <View>
-            <SectionTitle>Before we scan your physique</SectionTitle>
-            <Subtitle>
-              Follow these quick guidelines for the best, safest
-              results.
-            </Subtitle>
+            <SectionTitle>Before we scan</SectionTitle>
+            <Subtitle>Quick guidelines so the scan passes validation.</Subtitle>
 
             {[
-              "Wear gym shorts — no below-waist nudity.",
-              "Shirtless torso provides the most accurate analysis.",
-              "No sexually suggestive poses or gestures.",
+              "Wear gym shorts or underwear — legs must be visible.",
+              "Shirtless is required (shirts/hoodies will be rejected).",
               "Stand tall with arms relaxed at your sides.",
-              "Ensure bright, even lighting.",
+              "Bright, even lighting (avoid harsh shadows).",
               "We’ll capture front, side, and back angles.",
             ].map((txt) => (
               <View
@@ -936,11 +736,7 @@ export default function Onboarding() {
                   marginBottom: 12,
                 }}
               >
-                <Text
-                  style={{ color: "#00f5a0", marginRight: 8 }}
-                >
-                  •
-                </Text>
+                <Text style={{ color: "#00f5a0", marginRight: 8 }}>•</Text>
                 <Text style={{ color: "#ddd", flex: 1 }}>{txt}</Text>
               </View>
             ))}
@@ -952,11 +748,7 @@ export default function Onboarding() {
         {/* STEP 8 — Pre-Scan Hype + Begin Capture */}
         {step === 8 && (
           <View style={{ alignItems: "center" }}>
-            <Ionicons
-              name="scan"
-              size={100}
-              color="#7CFFB2"
-            />
+            <Ionicons name="scan" size={100} color="#7CFFB2" />
 
             <Text
               style={{
@@ -967,7 +759,7 @@ export default function Onboarding() {
                 textAlign: "center",
               }}
             >
-              You’re ready for your AI physique scan 🔍
+              You’re ready for your scan 🔍
             </Text>
 
             <Text
@@ -978,20 +770,14 @@ export default function Onboarding() {
                 textAlign: "center",
               }}
             >
-              We’ll break down your symmetry, proportions, and
-              aesthetic profile.
+              We’ll break down symmetry, proportions, and weak points.
             </Text>
 
-            <View
-              style={{
-                width: "80%",
-                marginBottom: 40,
-              }}
-            >
+            <View style={{ width: "80%", marginBottom: 40 }}>
               {[
-                "Analyzing upper vs lower body balance",
-                "Measuring symmetry & proportions",
-                "Preparing aesthetic & weak-point scores",
+                "Measuring upper vs lower balance",
+                "Checking symmetry & proportions",
+                "Scoring aesthetics + weak points",
               ].map((txt) => (
                 <View
                   key={txt}
@@ -1009,25 +795,15 @@ export default function Onboarding() {
                       marginRight: 10,
                     }}
                   />
-                  <Text
-                    style={{ color: "#7CFFB2", flex: 2 }}
-                  >
-                    {txt}
-                  </Text>
+                  <Text style={{ color: "#7CFFB2", flex: 2 }}>{txt}</Text>
                 </View>
               ))}
             </View>
 
-            <TouchableOpacity
-              onPress={handleFinish}
-              style={{ width: "80%" }}
-            >
+            <TouchableOpacity onPress={handleFinish} style={{ width: "80%" }}>
               <LinearGradient
                 colors={gradient}
-                style={{
-                  borderRadius: 14,
-                  paddingVertical: 16,
-                }}
+                style={{ borderRadius: 14, paddingVertical: 16 }}
               >
                 <Text
                   style={{
@@ -1050,8 +826,7 @@ export default function Onboarding() {
                 textAlign: "center",
               }}
             >
-              Your photos never leave your device — they are
-              processed locally.
+              Your photos stay on your device unless you choose to back them up later.
             </Text>
           </View>
         )}

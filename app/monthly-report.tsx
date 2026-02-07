@@ -1,5 +1,5 @@
 // app/monthly-report.tsx
-import React, { useEffect, useState, useMemo } from "react";
+import React, { useEffect, useState, useMemo, useCallback } from "react";
 import {
   View,
   Text,
@@ -10,8 +10,10 @@ import {
   Share,
   ActivityIndicator,
   Image,
+  Modal,
+  Pressable,
 } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { LinearGradient } from "expo-linear-gradient";
 import { Ionicons } from "@expo/vector-icons";
 import { Stack, useRouter, useLocalSearchParams } from "expo-router";
@@ -59,48 +61,89 @@ type LoggedSetDb = {
 };
 
 type LoggedExerciseDb = {
-  id: string;
+  id?: string;
   name: string;
   muscle: string;
   sets: LoggedSetDb[];
+  day_id?: string;
+  day_name?: string;
 };
 
 type WorkoutSessionRow = {
   id: string;
   user_id: string;
-  date: string; // ISO
-  workout_type: "ai" | "custom" | string;
-  workout_id: string | null;
-  day_id: string | null;
-  day_name: string | null;
-  duration_minutes: number | null;
-  exercises: LoggedExerciseDb[] | null;
+
+  timestamp?: string | null;
+  date?: string | null;
+
+  workout_type?: "ai" | "custom" | string | null;
+  workout_id?: string | null;
+  workout_name?: string | null;
+
+  exercises?: LoggedExerciseDb[] | null;
+  entries?: LoggedExerciseDb[] | null;
+
+  total_sets?: number | null;
+  completed_sets?: number | null;
+  completed_reps?: number | null;
 };
 
-const ANGLES: Array<"front" | "side" | "back"> = ["front", "side", "back"];
+type VolumeBucket =
+  | "chest"
+  | "back"
+  | "front_delts"
+  | "side_delts"
+  | "rear_delts"
+  | "biceps"
+  | "triceps"
+  | "quads"
+  | "hamstrings"
+  | "glutes"
+  | "calves"
+  | "core";
+
+const BUCKET_LABEL: Record<VolumeBucket, string> = {
+  chest: "Chest",
+  back: "Back",
+  front_delts: "Front Delts",
+  side_delts: "Side Delts",
+  rear_delts: "Rear Delts",
+  biceps: "Biceps",
+  triceps: "Triceps",
+  quads: "Quads",
+  hamstrings: "Hamstrings",
+  glutes: "Glutes",
+  calves: "Calves",
+  core: "Core / Abs",
+};
 
 /* ---------------------------------------------------------
  * Helpers
  * --------------------------------------------------------*/
 
+function safeNumber(v: any): number | null {
+  if (v === undefined || v === null) return null;
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function normalizeText(v: any) {
+  return String(v ?? "")
+    .toLowerCase()
+    .trim()
+    .replace(/[_\-]/g, " ")
+    .replace(/\s+/g, " ");
+}
+
 function getMonthRange(year: number, monthIndex: number) {
-  // monthIndex: JS-style 0–11
   const start = new Date(year, monthIndex, 1, 0, 0, 0, 0);
   const nextMonthStart = new Date(year, monthIndex + 1, 1, 0, 0, 0, 0);
   const endOfMonth = new Date(nextMonthStart.getTime() - 1);
-
-  return {
-    start,
-    nextMonthStart,
-    endOfMonth,
-  };
+  return { start, nextMonthStart, endOfMonth };
 }
 
 function formatMonthLabel(d: Date) {
-  return d.toLocaleDateString(undefined, {
-    month: "long",
-    year: "numeric",
-  });
+  return d.toLocaleDateString(undefined, { month: "long", year: "numeric" });
 }
 
 function daysUntil(date: Date) {
@@ -132,139 +175,214 @@ function formatDeltaInt(newVal?: number | null, oldVal?: number | null) {
 
 function formatShortDate(iso: string) {
   const d = new Date(iso);
-  return d.toLocaleDateString(undefined, {
-    month: "short",
-    day: "numeric",
-  });
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
-/* ---------------------------------------------------------
- * TRAINING VOLUME BUCKETS (Option 2 – detailed)
- * --------------------------------------------------------*/
+function getSessionExercises(s: WorkoutSessionRow): LoggedExerciseDb[] {
+  const exs =
+    (Array.isArray(s.exercises) && s.exercises) ||
+    (Array.isArray(s.entries) && s.entries) ||
+    [];
+  return exs.filter(Boolean) as LoggedExerciseDb[];
+}
 
-type VolumeBucket =
-  | "chest"
-  | "back"
-  | "front_delts"
-  | "side_delts"
-  | "rear_delts"
-  | "biceps"
-  | "triceps"
-  | "quads"
-  | "hamstrings"
-  | "glutes"
-  | "calves"
-  | "core";
-
-const BUCKET_LABEL: Record<VolumeBucket, string> = {
-  chest: "Chest",
-  back: "Back",
-  front_delts: "Front Delts",
-  side_delts: "Side Delts",
-  rear_delts: "Rear Delts",
-  biceps: "Biceps",
-  triceps: "Triceps",
-  quads: "Quads",
-  hamstrings: "Hamstrings",
-  glutes: "Glutes",
-  calves: "Calves",
-  core: "Core / Abs",
-};
-
-// Map exercise.muscle + exercise.name → one or more volume buckets
+/**
+ * ✅ Improved bucket mapping:
+ * - Recognizes "legs", "lower body", "quadriceps", "hamstrings", etc.
+ * - Uses both muscle field AND exercise name heuristics.
+ * - Designed to never miss leg work if you logged it.
+ */
 function mapExerciseToBuckets(ex: LoggedExerciseDb): VolumeBucket[] {
-  const muscle = (ex.muscle || "").toLowerCase();
-  const name = (ex.name || "").toLowerCase();
+  const muscle = normalizeText(ex.muscle);
+  const name = normalizeText(ex.name);
 
   const buckets: Set<VolumeBucket> = new Set();
 
   // Chest
-  if (muscle.includes("chest") || name.includes("bench") || name.includes("press")) {
+  if (
+    muscle.includes("chest") ||
+    muscle.includes("pec") ||
+    name.includes("bench") ||
+    (name.includes("press") &&
+      !name.includes("shoulder") &&
+      !name.includes("overhead"))
+  ) {
     buckets.add("chest");
   }
 
   // Back
   if (
     muscle.includes("back") ||
+    muscle.includes("lat") ||
+    muscle.includes("lats") ||
+    muscle.includes("trap") ||
+    muscle.includes("traps") ||
     name.includes("row") ||
     name.includes("pulldown") ||
-    name.includes("pull-up") ||
+    name.includes("pull down") ||
+    name.includes("pullup") ||
     name.includes("pull up") ||
-    name.includes("chin-up") ||
-    name.includes("chin up")
+    name.includes("chinup") ||
+    name.includes("chin up") ||
+    name.includes("deadlift") ||
+    name.includes("rack pull")
   ) {
     buckets.add("back");
   }
 
   // Delts / shoulders
-  if (muscle.includes("rear") && (muscle.includes("delt") || muscle.includes("shoulder"))) {
+  const isDelt = muscle.includes("delt") || muscle.includes("shoulder");
+
+  if (
+    isDelt &&
+    (muscle.includes("rear") ||
+      name.includes("rear delt") ||
+      name.includes("face pull"))
+  ) {
     buckets.add("rear_delts");
-  } else if (
-    (muscle.includes("lateral") || muscle.includes("side")) &&
-    (muscle.includes("delt") || muscle.includes("shoulder"))
+  }
+
+  if (
+    isDelt &&
+    (muscle.includes("side") ||
+      muscle.includes("lateral") ||
+      name.includes("lateral raise") ||
+      name.includes("upright row"))
   ) {
     buckets.add("side_delts");
-  } else if (
-    (muscle.includes("front") || muscle.includes("anterior")) &&
-    (muscle.includes("delt") || muscle.includes("shoulder"))
+  }
+
+  if (
+    isDelt &&
+    (muscle.includes("front") ||
+      muscle.includes("anterior") ||
+      name.includes("front raise") ||
+      name.includes("overhead press") ||
+      name.includes("shoulder press") ||
+      name.includes("military press"))
   ) {
-    buckets.add("front_delts");
-  } else if (muscle.includes("shoulder") || muscle.includes("delt")) {
-    // Generic shoulders → count as side delts (most hypertrophy focus) + a bit of front
-    buckets.add("side_delts");
     buckets.add("front_delts");
   }
 
+  // generic shoulders/delts
+  if (
+    (muscle.includes("shoulder") || muscle.includes("delt")) &&
+    !buckets.has("front_delts") &&
+    !buckets.has("side_delts") &&
+    !buckets.has("rear_delts")
+  ) {
+    buckets.add("front_delts");
+    buckets.add("side_delts");
+  }
+
   // Arms
-  if (muscle.includes("bicep") || name.includes("curl")) {
+  if (
+    muscle.includes("bicep") ||
+    muscle.includes("biceps") ||
+    name.includes("curl")
+  ) {
     buckets.add("biceps");
   }
+
   if (
     muscle.includes("tricep") ||
+    muscle.includes("triceps") ||
     name.includes("skullcrusher") ||
-    name.includes("tricep")
+    name.includes("pushdown") ||
+    name.includes("tricep") ||
+    name.includes("dip") ||
+    name.includes("close grip bench")
   ) {
     buckets.add("triceps");
   }
 
-  // Legs
+  // Legs (critical)
+  const saysLegs =
+    muscle.includes("leg") ||
+    muscle.includes("lower body") ||
+    muscle.includes("lower") ||
+    muscle.includes("legs") ||
+    muscle.includes("quad") ||
+    muscle.includes("quadricep") ||
+    muscle.includes("ham") ||
+    muscle.includes("hamstring") ||
+    muscle.includes("glute") ||
+    muscle.includes("calf");
+
+  // Quads
   if (
     muscle.includes("quad") ||
+    muscle.includes("quadricep") ||
     name.includes("squat") ||
+    name.includes("hack squat") ||
     name.includes("leg press") ||
-    name.includes("leg extension")
+    name.includes("leg extension") ||
+    name.includes("front squat") ||
+    name.includes("split squat") ||
+    name.includes("bulgarian") ||
+    name.includes("lunge") ||
+    name.includes("step up")
   ) {
     buckets.add("quads");
   }
+
+  // Hamstrings
   if (
+    muscle.includes("ham") ||
     muscle.includes("hamstring") ||
     name.includes("leg curl") ||
+    name.includes("romanian") ||
     name.includes("rdl") ||
-    name.includes("romanian")
+    name.includes("stiff leg") ||
+    name.includes("good morning") ||
+    name.includes("hip hinge")
   ) {
     buckets.add("hamstrings");
   }
-  if (muscle.includes("glute") || name.includes("hip thrust")) {
+
+  // Glutes
+  if (
+    muscle.includes("glute") ||
+    name.includes("hip thrust") ||
+    name.includes("glute") ||
+    name.includes("bridge") ||
+    name.includes("kickback")
+  ) {
     buckets.add("glutes");
   }
+
+  // Calves
   if (muscle.includes("calf") || name.includes("calf")) {
     buckets.add("calves");
   }
 
-  // Core / abs
+  // Fallback for generic "legs/lower body"
+  if (
+    saysLegs &&
+    !buckets.has("quads") &&
+    !buckets.has("hamstrings") &&
+    !buckets.has("glutes") &&
+    !buckets.has("calves")
+  ) {
+    buckets.add("quads");
+  }
+
+  // Core
   if (
     muscle.includes("core") ||
     muscle.includes("abs") ||
     name.includes("crunch") ||
     name.includes("plank") ||
     name.includes("leg raise") ||
+    name.includes("leg-raise") ||
     name.includes("dead bug") ||
-    name.includes("pallof")
+    name.includes("pallof") ||
+    name.includes("ab wheel") ||
+    name.includes("hanging knee raise")
   ) {
     buckets.add("core");
   }
 
-  // If we truly didn't match anything, return empty – we just won't count it
   return Array.from(buckets);
 }
 
@@ -274,6 +392,7 @@ function mapExerciseToBuckets(ex: LoggedExerciseDb): VolumeBucket[] {
 
 export default function MonthlyPhysiqueReportScreen() {
   const router = useRouter();
+  const insets = useSafeAreaInsets();
   const params = useLocalSearchParams<{ year?: string; month?: string }>();
 
   const { userId } = useAuthStore();
@@ -286,8 +405,25 @@ export default function MonthlyPhysiqueReportScreen() {
   const [lastPhotos, setLastPhotos] = useState<PhotoSet | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // Fullscreen photo viewer
+  const [photoViewer, setPhotoViewer] = useState<{
+    open: boolean;
+    uri: string | null;
+    label?: string;
+  }>({ open: false, uri: null });
+
+  const openPhoto = useCallback((uri: string, label?: string) => {
+    setPhotoViewer({ open: true, uri, label });
+  }, []);
+
+  const closePhoto = useCallback(() => {
+    setPhotoViewer({ open: false, uri: null });
+  }, []);
+
   const now = new Date();
-  const targetYear = params.year ? parseInt(String(params.year), 10) : now.getFullYear();
+  const targetYear = params.year
+    ? parseInt(String(params.year), 10)
+    : now.getFullYear();
   const targetMonthIndex = params.month
     ? parseInt(String(params.month), 10)
     : now.getMonth();
@@ -307,6 +443,7 @@ export default function MonthlyPhysiqueReportScreen() {
    * --------------------------------------------------------*/
   useEffect(() => {
     if (!hasHydratedAuth) return;
+
     if (!userId) {
       setError("Login required");
       setLoading(false);
@@ -318,21 +455,25 @@ export default function MonthlyPhysiqueReportScreen() {
         setLoading(true);
         setError(null);
 
-        const [analysisRes, workoutRes] = await Promise.all([
-          supabase
-            .from("analysis_history")
-            .select("*")
-            .eq("user_id", userId)
-            .gte("created_at", monthStart.toISOString())
-            .lt("created_at", nextMonthStart.toISOString())
-            .order("created_at", { ascending: true }),
-          supabase
-            .from("workout_sessions")
-            .select("*")
-            .eq("user_id", userId)
-            .gte("date", monthStart.toISOString())
-            .lt("date", nextMonthStart.toISOString())
-            .order("date", { ascending: true }),
+        const analysisPromise = supabase
+          .from("analysis_history")
+          .select("*")
+          .eq("user_id", userId)
+          .gte("created_at", monthStart.toISOString())
+          .lt("created_at", nextMonthStart.toISOString())
+          .order("created_at", { ascending: true });
+
+        const workoutsPrimary = supabase
+          .from("workout_sessions")
+          .select("*")
+          .eq("user_id", userId)
+          .gte("timestamp", monthStart.toISOString())
+          .lt("timestamp", nextMonthStart.toISOString())
+          .order("timestamp", { ascending: true });
+
+        const [analysisRes, workoutResPrimary] = await Promise.all([
+          analysisPromise,
+          workoutsPrimary,
         ]);
 
         if (analysisRes.error) {
@@ -343,12 +484,33 @@ export default function MonthlyPhysiqueReportScreen() {
           setAnalyses((analysisRes.data as AnalysisRow[]) || []);
         }
 
-        if (workoutRes.error) {
-          console.log("Monthly report workouts error:", workoutRes.error);
-          // Don't hard fail the screen – just no workouts
-          setWorkouts([]);
+        if (workoutResPrimary.error) {
+          console.log(
+            "Monthly report workouts (timestamp) error:",
+            workoutResPrimary.error
+          );
+
+          const workoutResFallback = await supabase
+            .from("workout_sessions")
+            .select("*")
+            .eq("user_id", userId)
+            .gte("date", monthStart.toISOString())
+            .lt("date", nextMonthStart.toISOString())
+            .order("date", { ascending: true });
+
+          if (workoutResFallback.error) {
+            console.log(
+              "Monthly report workouts (date) error:",
+              workoutResFallback.error
+            );
+            setWorkouts([]);
+          } else {
+            setWorkouts(
+              (workoutResFallback.data as WorkoutSessionRow[]) || []
+            );
+          }
         } else {
-          setWorkouts((workoutRes.data as WorkoutSessionRow[]) || []);
+          setWorkouts((workoutResPrimary.data as WorkoutSessionRow[]) || []);
         }
       } catch (e: any) {
         console.log("Monthly report unexpected error:", e);
@@ -400,7 +562,6 @@ export default function MonthlyPhysiqueReportScreen() {
    * --------------------------------------------------------*/
   const firstAnalysis = analyses[0];
   const lastAnalysis = analyses[analyses.length - 1];
-
   const hasDataThisMonth = !!firstAnalysis;
 
   const keyImprovements = useMemo(() => {
@@ -452,9 +613,7 @@ export default function MonthlyPhysiqueReportScreen() {
     return keys.map(({ key, label }) => {
       const before = firstMuscles[key];
       const after = lastMuscles[key];
-      if (before == null || after == null) {
-        return { label, value: "—" };
-      }
+      if (before == null || after == null) return { label, value: "—" };
       const diff = after - before;
       const sign = diff > 0 ? "+" : diff < 0 ? "" : "";
       return { label, value: `${sign}${diff.toFixed(0)} pts` };
@@ -462,13 +621,15 @@ export default function MonthlyPhysiqueReportScreen() {
   }, [firstAnalysis, lastAnalysis]);
 
   /* ---------------------------------------------------------
-   * TRAINING VOLUME DERIVED STATS (from workout_sessions)
+   * TRAINING STATS (NO TRAINING TIME)
    * --------------------------------------------------------*/
   const trainingStats = useMemo(() => {
     if (!workouts.length) {
       return {
         sessions: 0,
         totalSets: 0,
+        completedSets: 0,
+        completedReps: 0,
         volume: {} as Record<VolumeBucket, number>,
         mostWorked: [] as VolumeBucket[],
         underTrained: [] as VolumeBucket[],
@@ -491,38 +652,58 @@ export default function MonthlyPhysiqueReportScreen() {
     };
 
     let totalSets = 0;
+    let completedSets = 0;
+    let completedReps = 0;
 
     for (const session of workouts) {
-      const exs = session.exercises || [];
+      const hasTotalCols =
+        safeNumber(session.total_sets) != null ||
+        safeNumber(session.completed_sets) != null ||
+        safeNumber(session.completed_reps) != null;
+
+      if (safeNumber(session.total_sets) != null)
+        totalSets += safeNumber(session.total_sets)!;
+      if (safeNumber(session.completed_sets) != null)
+        completedSets += safeNumber(session.completed_sets)!;
+      if (safeNumber(session.completed_reps) != null)
+        completedReps += safeNumber(session.completed_reps)!;
+
+      const exs = getSessionExercises(session);
+      const shouldDeriveTotals = !hasTotalCols;
+
       for (const ex of exs) {
-        const setCount = (ex.sets || []).length;
+        const setCount = Array.isArray(ex.sets) ? ex.sets.length : 0;
         if (!setCount) continue;
 
-        totalSets += setCount;
+        if (shouldDeriveTotals) totalSets += setCount;
+
+        if (shouldDeriveTotals) {
+          for (const s of ex.sets || []) {
+            const actual = safeNumber((s as any).actual);
+            if (actual != null) {
+              completedSets += 1;
+              completedReps += actual;
+            }
+          }
+        }
 
         const buckets = mapExerciseToBuckets(ex);
-        if (!buckets.length) continue;
-
-        for (const b of buckets) {
-          volume[b] += setCount;
-        }
+        for (const b of buckets) volume[b] += setCount;
       }
     }
 
-    // Figure out most-worked vs under-trained (ignore 0-volume buckets)
     const nonZeroEntries = (Object.entries(volume) as [VolumeBucket, number][])
       .filter(([, v]) => v > 0)
-      .sort((a, b) => b[1] - a[1]); // desc
+      .sort((a, b) => b[1] - a[1]);
 
     const mostWorked = nonZeroEntries.slice(0, 2).map(([b]) => b);
-    const underTrained = nonZeroEntries
-      .slice(-2)
-      .map(([b]) => b)
-      .reverse(); // smallest first
+    const underTrained = nonZeroEntries.slice(-2).map(([b]) => b).reverse();
 
     return {
       sessions: workouts.length,
       totalSets,
+      completedSets,
+      completedReps,
       volume,
       mostWorked,
       underTrained,
@@ -544,32 +725,142 @@ export default function MonthlyPhysiqueReportScreen() {
   };
 
   /* ---------------------------------------------------------
-   * Angle card with actual photos
+   * Workout Activity card
    * --------------------------------------------------------*/
-  const renderAngleCard = (title: string, angle: "front" | "side" | "back") => {
-    const beforeUri = firstPhotos?.[`${angle}Uri` as keyof PhotoSet] as
-      | string
-      | undefined;
-    const afterUri = lastPhotos?.[`${angle}Uri` as keyof PhotoSet] as
-      | string
-      | undefined;
+  const renderWorkoutActivityCard = () => {
+    const {
+      sessions,
+      totalSets,
+      completedSets,
+      completedReps,
+      volume,
+      mostWorked,
+      underTrained,
+    } = trainingStats;
 
-    const PhotoBox = ({ uri, label }: { uri?: string; label: string }) => (
-      <View style={styles.photoSlot}>
-        <View style={styles.photoInner}>
-          {uri ? (
-            <Image
-              source={{ uri }}
-              style={{ width: "100%", height: "100%" }}
-              resizeMode="cover"
-            />
-          ) : (
-            <Ionicons name="camera-outline" size={26} color={colors.dim} />
-          )}
+    return (
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Workout Activity (Training Volume)</Text>
+
+        <View style={styles.summaryRow}>
+          <Text style={styles.summaryLabel}>Workouts Logged</Text>
+          <Text style={styles.summaryValue}>{sessions}</Text>
         </View>
-        <Text style={styles.photoLabel}>{label}</Text>
+
+        <View style={styles.summaryRow}>
+          <Text style={styles.summaryLabel}>Total Sets</Text>
+          <Text style={styles.summaryValue}>{totalSets}</Text>
+        </View>
+
+        <View style={styles.summaryRow}>
+          <Text style={styles.summaryLabel}>Completed Sets</Text>
+          <Text style={styles.summaryValue}>{completedSets}</Text>
+        </View>
+
+        <View style={styles.summaryRow}>
+          <Text style={styles.summaryLabel}>Completed Reps</Text>
+          <Text style={styles.summaryValue}>{completedReps}</Text>
+        </View>
+
+        {sessions > 0 && (
+          <>
+            <View style={{ height: 10 }} />
+
+            <Text style={{ color: colors.dim, fontSize: 12, marginBottom: 6 }}>
+              Muscle volume this month
+            </Text>
+
+            <View style={styles.muscleGrid}>
+              {(Object.entries(volume) as [VolumeBucket, number][])
+                .filter(([, v]) => v > 0)
+                .sort((a, b) => b[1] - a[1])
+                .map(([bucket, v]) => (
+                  <View key={bucket} style={styles.muscleItem}>
+                    <Text style={styles.muscleLabel}>
+                      {BUCKET_LABEL[bucket]}
+                    </Text>
+                    <Text style={styles.muscleValue}>
+                      {v} set{v === 1 ? "" : "s"}
+                    </Text>
+                  </View>
+                ))}
+            </View>
+
+            {(mostWorked.length > 0 || underTrained.length > 0) && (
+              <View style={{ marginTop: 8 }}>
+                {mostWorked.length > 0 && (
+                  <Text style={styles.trainingHint}>
+                    <Text style={{ fontWeight: "700", color: colors.accent }}>
+                      Most worked:
+                    </Text>{" "}
+                    {mostWorked.map((b) => BUCKET_LABEL[b]).join(", ")}
+                  </Text>
+                )}
+                {underTrained.length > 0 && (
+                  <Text style={styles.trainingHint}>
+                    <Text
+                      style={{
+                        fontWeight: "700",
+                        color: "rgba(255,255,255,0.9)",
+                      }}
+                    >
+                      Undertrained:
+                    </Text>{" "}
+                    {underTrained.map((b) => BUCKET_LABEL[b]).join(", ")}
+                  </Text>
+                )}
+              </View>
+            )}
+          </>
+        )}
+
+        {sessions === 0 && (
+          <Text style={{ color: colors.dim, fontSize: 12, marginTop: 8 }}>
+            No workouts logged in NattyCheck this month yet. Start a session
+            from the Workouts tab to see your training volume here.
+          </Text>
+        )}
       </View>
     );
+  };
+
+  /* ---------------------------------------------------------
+   * Angle card with tappable photos → fullscreen modal
+   * --------------------------------------------------------*/
+  const renderAngleCard = (title: string, angle: "front" | "side" | "back") => {
+    const beforeUri = firstPhotos?.[
+      `${angle}Uri` as keyof PhotoSet
+    ] as string | undefined;
+    const afterUri = lastPhotos?.[
+      `${angle}Uri` as keyof PhotoSet
+    ] as string | undefined;
+
+    const PhotoBox = ({ uri, label }: { uri?: string; label: string }) => {
+      const canOpen = !!uri;
+      return (
+        <Pressable
+          disabled={!canOpen}
+          onPress={() => canOpen && openPhoto(uri!, label)}
+          style={({ pressed }) => [
+            styles.photoSlot,
+            canOpen && pressed ? { opacity: 0.85 } : null,
+          ]}
+        >
+          <View style={styles.photoInner}>
+            {uri ? (
+              <Image
+                source={{ uri }}
+                style={{ width: "100%", height: "100%" }}
+                resizeMode="cover"
+              />
+            ) : (
+              <Ionicons name="camera-outline" size={26} color={colors.dim} />
+            )}
+          </View>
+          <Text style={styles.photoLabel}>{label}</Text>
+        </Pressable>
+      );
+    };
 
     return (
       <View style={styles.card}>
@@ -615,285 +906,84 @@ export default function MonthlyPhysiqueReportScreen() {
   );
 
   /* ---------------------------------------------------------
-   * Small helper: Workout Activity card
+   * Render body
    * --------------------------------------------------------*/
-  const renderWorkoutActivityCard = () => {
-    const { sessions, totalSets, volume, mostWorked, underTrained } =
-      trainingStats;
-
-    return (
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>Workout Activity (Training Volume)</Text>
-
-        <View style={styles.summaryRow}>
-          <Text style={styles.summaryLabel}>Workouts Logged</Text>
-          <Text style={styles.summaryValue}>{sessions}</Text>
-        </View>
-
-        <View style={styles.summaryRow}>
-          <Text style={styles.summaryLabel}>Total Sets</Text>
-          <Text style={styles.summaryValue}>{totalSets}</Text>
-        </View>
-
-        {sessions > 0 && (
-          <>
-            <View style={{ height: 10 }} />
-
-            <Text
-              style={{
-                color: colors.dim,
-                fontSize: 12,
-                marginBottom: 6,
-              }}
-            >
-              Muscle volume this month
-            </Text>
-
-            <View style={styles.muscleGrid}>
-              {(Object.entries(volume) as [VolumeBucket, number][])
-                .filter(([, v]) => v > 0)
-                .sort((a, b) => b[1] - a[1])
-                .map(([bucket, v]) => (
-                  <View key={bucket} style={styles.muscleItem}>
-                    <Text style={styles.muscleLabel}>
-                      {BUCKET_LABEL[bucket]}
-                    </Text>
-                    <Text style={styles.muscleValue}>
-                      {v} set{v === 1 ? "" : "s"}
-                    </Text>
-                  </View>
-                ))}
-            </View>
-
-            {(mostWorked.length > 0 || underTrained.length > 0) && (
-              <View style={{ marginTop: 8 }}>
-                {mostWorked.length > 0 && (
-                  <Text style={styles.trainingHint}>
-                    <Text style={{ fontWeight: "700", color: colors.accent }}>
-                      Most worked:
-                    </Text>{" "}
-                    {mostWorked.map((b) => BUCKET_LABEL[b]).join(", ")}
-                  </Text>
-                )}
-                {underTrained.length > 0 && (
-                  <Text style={styles.trainingHint}>
-                    <Text
-                      style={{ fontWeight: "700", color: "rgba(255,255,255,0.9)" }}
-                    >
-                      Undertrained:
-                    </Text>{" "}
-                    {underTrained.map((b) => BUCKET_LABEL[b]).join(", ")}
-                  </Text>
-                )}
-              </View>
-            )}
-          </>
-        )}
-
-        {sessions === 0 && (
-          <Text style={{ color: colors.dim, fontSize: 12, marginTop: 8 }}>
-            No workouts logged in NattyCheck this month yet. Start a session
-            from the Workouts tab to see your training volume here.
+  const body = () => {
+    if (!hasHydratedAuth || loading) {
+      return (
+        <View style={styles.center}>
+          <ActivityIndicator size="large" color={colors.accent} />
+          <Text style={{ color: colors.dim, marginTop: 8 }}>
+            Building your monthly report…
           </Text>
-        )}
-      </View>
-    );
-  };
+        </View>
+      );
+    }
 
-  /* ---------------------------------------------------------
-   * Render states
-   * --------------------------------------------------------*/
-
-  if (!hasHydratedAuth || loading) {
-    return (
-      <>
-        {header}
-        <SafeAreaView style={styles.safe}>
-          <View
-            style={{ flex: 1, justifyContent: "center", alignItems: "center" }}
-          >
-            <ActivityIndicator size="large" color={colors.accent} />
-            <Text style={{ color: colors.dim, marginTop: 8 }}>
-              Building your monthly report…
-            </Text>
-          </View>
-        </SafeAreaView>
-      </>
-    );
-  }
-
-  if (error === "Login required" || !userId) {
-    return (
-      <>
-        {header}
-        <SafeAreaView style={styles.safe}>
-          <View
+    if (error === "Login required" || !userId) {
+      return (
+        <View style={[styles.center, { padding: 24 }]}>
+          <Text
             style={{
-              flex: 1,
-              justifyContent: "center",
-              alignItems: "center",
-              padding: 24,
+              color: colors.text,
+              fontSize: 18,
+              fontWeight: "700",
+              marginBottom: 6,
             }}
           >
-            <Text
-              style={{
-                color: colors.text,
-                fontSize: 18,
-                fontWeight: "700",
-                marginBottom: 6,
-              }}
-            >
-              Sign in to view your report
-            </Text>
-            <Text style={{ color: colors.dim, textAlign: "center" }}>
-              Monthly reports are linked to your account so we can track your
-              progress over time.
-            </Text>
-          </View>
-        </SafeAreaView>
-      </>
-    );
-  }
+            Sign in to view your report
+          </Text>
+          <Text style={{ color: colors.dim, textAlign: "center" }}>
+            Monthly reports are linked to your account so we can track your
+            progress over time.
+          </Text>
+        </View>
+      );
+    }
 
-  if (!hasDataThisMonth) {
-    return (
-      <>
-        {header}
-        <SafeAreaView style={styles.safe}>
-          <ScrollView
-            style={styles.scroll}
-            contentContainerStyle={{ paddingBottom: 32, flexGrow: 1 }}
-            showsVerticalScrollIndicator={false}
-          >
-            <View style={styles.header}>
-              <Text style={styles.headerTitle}>Monthly Physique Report</Text>
-              <View style={styles.headerRow}>
-                <View style={styles.monthPill}>
-                  <Text style={styles.monthText}>{monthLabel}</Text>
-                </View>
-              </View>
-            </View>
-
-            <View style={[styles.card, { marginTop: 8 }]}>
-              <Text style={styles.cardTitle}>No scans for this month</Text>
-              <Text style={{ color: colors.dim, fontSize: 13, marginTop: 4 }}>
-                Do at least one NattyCheck scan this month and we’ll build a
-                full before/after report using your first and last scan.
-              </Text>
-            </View>
-
-            {/* Even if no scans, we can still show workout activity */}
-            {renderWorkoutActivityCard()}
-          </ScrollView>
-        </SafeAreaView>
-      </>
-    );
-  }
-
-  // If month isn’t complete yet → show countdown (only meaningful for current month)
-  if (!monthComplete) {
-    return (
-      <>
-        {header}
-        <SafeAreaView style={styles.safe}>
-          <ScrollView
-            style={styles.scroll}
-            contentContainerStyle={{ paddingBottom: 32 }}
-            showsVerticalScrollIndicator={false}
-          >
-            <View style={styles.header}>
-              <Text style={styles.headerTitle}>Monthly Physique Report</Text>
-
-              <View style={styles.headerRow}>
-                <View style={styles.monthPill}>
-                  <Text style={styles.monthText}>{monthLabel}</Text>
-                </View>
-              </View>
-            </View>
-
-            <View style={styles.card}>
-              <Text style={styles.cardTitle}>Report unlocks soon</Text>
-              <Text style={{ color: colors.dim, fontSize: 13, marginTop: 4 }}>
-                We’ll generate your full monthly report using your first and last
-                scan of {monthLabel}.
-              </Text>
-
-              <View style={{ marginTop: 16, alignItems: "center" }}>
-                <Text
-                  style={{
-                    color: colors.text,
-                    fontSize: 32,
-                    fontWeight: "800",
-                  }}
-                >
-                  {daysRemaining} day{daysRemaining === 1 ? "" : "s"}
-                </Text>
-                <Text style={{ color: colors.dim, marginTop: 4 }}>
-                  Check back on{" "}
-                  {endOfMonth.toLocaleDateString(undefined, {
-                    month: "short",
-                    day: "numeric",
-                  })}
-                </Text>
-              </View>
-
-              <View style={{ marginTop: 18 }}>
-                <Text
-                  style={{ color: colors.dim, fontSize: 12, marginBottom: 4 }}
-                >
-                  Scans so far this month
-                </Text>
-                <Text
-                  style={{
-                    color: colors.accent,
-                    fontSize: 20,
-                    fontWeight: "800",
-                  }}
-                >
-                  {analyses.length}
-                </Text>
-              </View>
-
-              <View style={{ marginTop: 10 }}>
-                <Text
-                  style={{ color: colors.dim, fontSize: 12, marginBottom: 4 }}
-                >
-                  Workouts logged this month
-                </Text>
-                <Text
-                  style={{
-                    color: colors.accent,
-                    fontSize: 20,
-                    fontWeight: "800",
-                  }}
-                >
-                  {trainingStats.sessions}
-                </Text>
-              </View>
-            </View>
-
-            {renderWorkoutActivityCard()}
-          </ScrollView>
-        </SafeAreaView>
-      </>
-    );
-  }
-
-  /* ---------------------------------------------------------
-   * Month is complete → full report
-   * --------------------------------------------------------*/
-
-  return (
-    <>
-      {header}
-
-      <SafeAreaView style={styles.safe}>
+    if (!hasDataThisMonth) {
+      return (
         <ScrollView
           style={styles.scroll}
-          contentContainerStyle={{ paddingBottom: 32 }}
+          contentContainerStyle={{
+            paddingBottom: 32,
+            paddingTop: insets.top + 8,
+            flexGrow: 1,
+          }}
           showsVerticalScrollIndicator={false}
         >
-          {/* HEADER */}
+          <View style={styles.header}>
+            <Text style={styles.headerTitle}>Monthly Physique Report</Text>
+            <View style={styles.headerRow}>
+              <View style={styles.monthPill}>
+                <Text style={styles.monthText}>{monthLabel}</Text>
+              </View>
+            </View>
+          </View>
+
+          <View style={[styles.card, { marginTop: 8 }]}>
+            <Text style={styles.cardTitle}>No scans for this month</Text>
+            <Text style={{ color: colors.dim, fontSize: 13, marginTop: 4 }}>
+              Do at least one NattyCheck scan this month and we’ll build a full
+              before/after report using your first and last scan.
+            </Text>
+          </View>
+
+          {renderWorkoutActivityCard()}
+        </ScrollView>
+      );
+    }
+
+    if (!monthComplete) {
+      return (
+        <ScrollView
+          style={styles.scroll}
+          contentContainerStyle={{
+            paddingBottom: 32,
+            paddingTop: insets.top + 8,
+          }}
+          showsVerticalScrollIndicator={false}
+        >
           <View style={styles.header}>
             <Text style={styles.headerTitle}>Monthly Physique Report</Text>
 
@@ -901,139 +991,276 @@ export default function MonthlyPhysiqueReportScreen() {
               <View style={styles.monthPill}>
                 <Text style={styles.monthText}>{monthLabel}</Text>
               </View>
+            </View>
+          </View>
 
+          <View style={styles.card}>
+            <Text style={styles.cardTitle}>Report unlocks soon</Text>
+            <Text style={{ color: colors.dim, fontSize: 13, marginTop: 4 }}>
+              We’ll generate your full monthly report using your first and last
+              scan of {monthLabel}.
+            </Text>
+
+            <View style={{ marginTop: 16, alignItems: "center" }}>
+              <Text
+                style={{
+                  color: colors.text,
+                  fontSize: 32,
+                  fontWeight: "800",
+                }}
+              >
+                {daysRemaining} day{daysRemaining === 1 ? "" : "s"}
+              </Text>
+              <Text style={{ color: colors.dim, marginTop: 4 }}>
+                Check back on{" "}
+                {endOfMonth.toLocaleDateString(undefined, {
+                  month: "short",
+                  day: "numeric",
+                })}
+              </Text>
+            </View>
+
+            <View style={{ marginTop: 18 }}>
+              <Text style={{ color: colors.dim, fontSize: 12, marginBottom: 4 }}>
+                Scans so far this month
+              </Text>
+              <Text
+                style={{
+                  color: colors.accent,
+                  fontSize: 20,
+                  fontWeight: "800",
+                }}
+              >
+                {analyses.length}
+              </Text>
+            </View>
+
+            <View style={{ marginTop: 10 }}>
+              <Text style={{ color: colors.dim, fontSize: 12, marginBottom: 4 }}>
+                Workouts logged this month
+              </Text>
+              <Text
+                style={{
+                  color: colors.accent,
+                  fontSize: 20,
+                  fontWeight: "800",
+                }}
+              >
+                {trainingStats.sessions}
+              </Text>
+            </View>
+          </View>
+
+          {renderWorkoutActivityCard()}
+        </ScrollView>
+      );
+    }
+
+    // Month complete → full report
+    const showTrendPill =
+      keyImprovements.scoreDelta.startsWith("+") ||
+      keyImprovements.scoreDelta.startsWith("-");
+
+    return (
+      <ScrollView
+        style={styles.scroll}
+        contentContainerStyle={{ paddingBottom: 32, paddingTop: insets.top + 8 }}
+        showsVerticalScrollIndicator={false}
+      >
+        <View style={styles.header}>
+          <Text style={styles.headerTitle}>Monthly Physique Report</Text>
+
+          <View style={styles.headerRow}>
+            <View style={styles.monthPill}>
+              <Text style={styles.monthText}>{monthLabel}</Text>
+            </View>
+
+            {/* ✅ Removed "Stable" concept:
+                only show this pill if it's clearly Improved/Declined */}
+            {showTrendPill && (
               <View style={styles.trendPill}>
                 <Ionicons
                   name={
                     keyImprovements.scoreDelta.startsWith("+")
                       ? "trending-up-outline"
-                      : keyImprovements.scoreDelta.startsWith("-")
-                      ? "trending-down-outline"
-                      : "remove-outline"
+                      : "trending-down-outline"
                   }
                   size={14}
                   color="#043315"
                   style={{ marginRight: 4 }}
                 />
                 <Text style={styles.trendText}>
-                  {keyImprovements.scoreDelta === "—"
-                    ? "Stable"
-                    : keyImprovements.scoreDelta.startsWith("+")
+                  {keyImprovements.scoreDelta.startsWith("+")
                     ? "Improved"
-                    : keyImprovements.scoreDelta.startsWith("-")
-                    ? "Declined"
-                    : "Stable"}
+                    : "Declined"}
                 </Text>
               </View>
+            )}
+          </View>
+
+          <Text style={{ color: colors.dim, fontSize: 12, marginTop: 4 }}>
+            Based on scans from {formatShortDate(firstAnalysis.created_at)} to{" "}
+            {formatShortDate(lastAnalysis.created_at)}
+          </Text>
+        </View>
+
+        {renderAngleCard("Front Angle Progress", "front")}
+        {renderAngleCard("Side Angle Progress", "side")}
+        {renderAngleCard("Back Angle Progress", "back")}
+
+        <View style={styles.card}>
+          <Text style={styles.cardTitle}>Key Improvements</Text>
+
+          <View style={styles.keyRow}>
+            <View style={styles.keyItem}>
+              <Text style={styles.keyLabel}>Physique Score</Text>
+              <Text style={styles.keyValuePositive}>
+                {keyImprovements.scoreDelta}
+              </Text>
             </View>
 
-            <Text style={{ color: colors.dim, fontSize: 12, marginTop: 4 }}>
-              Based on scans from {formatShortDate(firstAnalysis.created_at)} to{" "}
-              {formatShortDate(lastAnalysis.created_at)}
+            <View style={styles.keyItem}>
+              <Text style={styles.keyLabel}>Body Fat</Text>
+              <Text style={styles.keyValuePositive}>
+                {keyImprovements.bodyfatDelta}
+              </Text>
+            </View>
+          </View>
+
+          <View style={[styles.keyRow, { marginTop: 14 }]}>
+            <View style={styles.keyItem}>
+              <Text style={styles.keyLabel}>Symmetry</Text>
+              <Text style={styles.keyValuePositive}>
+                {keyImprovements.symmetryDelta}
+              </Text>
+            </View>
+
+            <View style={styles.keyItem}>
+              <Text style={styles.keyLabel}>Scans</Text>
+              <Text style={styles.keyValueNeutral}>
+                {keyImprovements.scansThisMonth}
+              </Text>
+            </View>
+          </View>
+        </View>
+
+        <View style={styles.card}>
+          <Text style={styles.cardTitle}>Muscle Group Progress</Text>
+
+          <View style={styles.muscleGrid}>
+            {muscleProgress.map((m) => (
+              <View key={m.label} style={styles.muscleItem}>
+                <Text style={styles.muscleLabel}>{m.label}</Text>
+                <Text style={styles.muscleValue}>{m.value}</Text>
+              </View>
+            ))}
+          </View>
+        </View>
+
+        {renderWorkoutActivityCard()}
+
+        <View style={styles.card}>
+          <Text style={styles.cardTitle}>Scan Activity Summary</Text>
+
+          <View style={styles.summaryRow}>
+            <Text style={styles.summaryLabel}>Total Scans</Text>
+            <Text style={styles.summaryValue}>{analyses.length}</Text>
+          </View>
+
+          <View style={styles.summaryRow}>
+            <Text style={styles.summaryLabel}>First Scan</Text>
+            <Text style={styles.summaryValue}>
+              {formatShortDate(firstAnalysis.created_at)}
             </Text>
           </View>
 
-          {/* ANGLE PROGRESS CARDS */}
-          {renderAngleCard("Front Angle Progress", "front")}
-          {renderAngleCard("Side Angle Progress", "side")}
-          {renderAngleCard("Back Angle Progress", "back")}
-
-          {/* KEY IMPROVEMENTS */}
-          <View style={styles.card}>
-            <Text style={styles.cardTitle}>Key Improvements</Text>
-
-            <View style={styles.keyRow}>
-              <View style={styles.keyItem}>
-                <Text style={styles.keyLabel}>Physique Score</Text>
-                <Text style={styles.keyValuePositive}>
-                  {keyImprovements.scoreDelta}
-                </Text>
-              </View>
-
-              <View style={styles.keyItem}>
-                <Text style={styles.keyLabel}>Body Fat</Text>
-                <Text style={styles.keyValuePositive}>
-                  {keyImprovements.bodyfatDelta}
-                </Text>
-              </View>
-            </View>
-
-            <View style={[styles.keyRow, { marginTop: 14 }]}>
-              <View style={styles.keyItem}>
-                <Text style={styles.keyLabel}>Symmetry</Text>
-                <Text style={styles.keyValuePositive}>
-                  {keyImprovements.symmetryDelta}
-                </Text>
-              </View>
-
-              <View style={styles.keyItem}>
-                <Text style={styles.keyLabel}>Scans</Text>
-                <Text style={styles.keyValueNeutral}>
-                  {keyImprovements.scansThisMonth}
-                </Text>
-              </View>
-            </View>
+          <View style={styles.summaryRow}>
+            <Text style={styles.summaryLabel}>Last Scan</Text>
+            <Text style={styles.summaryValue}>
+              {formatShortDate(lastAnalysis.created_at)}
+            </Text>
           </View>
+        </View>
 
-          {/* MUSCLE PROGRESS (ANALYSIS-BASED) */}
-          <View style={styles.card}>
-            <Text style={styles.cardTitle}>Muscle Group Progress</Text>
+        <TouchableOpacity onPress={handleShare} style={styles.shareWrapper}>
+          <LinearGradient colors={gradient} style={styles.shareButton}>
+            <Ionicons
+              name="share-outline"
+              size={18}
+              color="#00110A"
+              style={{ marginRight: 6 }}
+            />
+            <Text style={styles.shareText}>Share</Text>
+          </LinearGradient>
+        </TouchableOpacity>
 
-            <View style={styles.muscleGrid}>
-              {muscleProgress.map((m) => (
-                <View key={m.label} style={styles.muscleItem}>
-                  <Text style={styles.muscleLabel}>{m.label}</Text>
-                  <Text style={styles.muscleValue}>{m.value}</Text>
-                </View>
-              ))}
-            </View>
-          </View>
+        <Text style={styles.footerHint}>
+          You’re the only one who sees this until you share it.
+        </Text>
+      </ScrollView>
+    );
+  };
 
-          {/* TRAINING VOLUME / WORKOUT ACTIVITY */}
-          {renderWorkoutActivityCard()}
+  return (
+    <>
+      {header}
+      <SafeAreaView style={styles.safe}>{body()}</SafeAreaView>
 
-          {/* ACTIVITY SUMMARY (SCANS) */}
-          <View style={styles.card}>
-            <Text style={styles.cardTitle}>Scan Activity Summary</Text>
-
-            <View style={styles.summaryRow}>
-              <Text style={styles.summaryLabel}>Total Scans</Text>
-              <Text style={styles.summaryValue}>{analyses.length}</Text>
-            </View>
-
-            <View style={styles.summaryRow}>
-              <Text style={styles.summaryLabel}>First Scan</Text>
-              <Text style={styles.summaryValue}>
-                {formatShortDate(firstAnalysis.created_at)}
-              </Text>
-            </View>
-
-            <View style={styles.summaryRow}>
-              <Text style={styles.summaryLabel}>Last Scan</Text>
-              <Text style={styles.summaryValue}>
-                {formatShortDate(lastAnalysis.created_at)}
-              </Text>
-            </View>
-          </View>
-
-          {/* SHARE */}
-          <TouchableOpacity onPress={handleShare} style={styles.shareWrapper}>
-            <LinearGradient colors={gradient} style={styles.shareButton}>
-              <Ionicons
-                name="share-outline"
-                size={18}
-                color="#00110A"
-                style={{ marginRight: 6 }}
+      {/* ✅ Fullscreen photo modal (renders once, works everywhere) */}
+      <Modal
+        visible={photoViewer.open}
+        transparent
+        animationType="fade"
+        onRequestClose={closePhoto}
+      >
+        <Pressable
+          onPress={closePhoto}
+          style={{
+            flex: 1,
+            backgroundColor: "rgba(0,0,0,0.92)",
+            justifyContent: "center",
+            alignItems: "center",
+            padding: 16,
+          }}
+        >
+          <Pressable
+            onPress={(e) => e.stopPropagation()}
+            style={{
+              width: "100%",
+              maxWidth: 420,
+              borderRadius: 16,
+              overflow: "hidden",
+              borderWidth: 1,
+              borderColor: "rgba(255,255,255,0.12)",
+              backgroundColor: "#000",
+            }}
+          >
+            {!!photoViewer.uri && (
+              <Image
+                source={{ uri: photoViewer.uri }}
+                style={{ width: "100%", height: 520 }}
+                resizeMode="contain"
               />
-              <Text style={styles.shareText}>Share</Text>
-            </LinearGradient>
-          </TouchableOpacity>
+            )}
 
-          <Text style={styles.footerHint}>
-            You’re the only one who sees this until you share it.
-          </Text>
-        </ScrollView>
-      </SafeAreaView>
+            <View
+              style={{
+                padding: 12,
+                flexDirection: "row",
+                alignItems: "center",
+                justifyContent: "space-between",
+              }}
+            >
+              <Text style={{ color: "#fff", fontWeight: "700" }}>
+                {photoViewer.label ?? "Photo"}
+              </Text>
+              <TouchableOpacity onPress={closePhoto} style={{ padding: 6 }}>
+                <Ionicons name="close" size={22} color="#fff" />
+              </TouchableOpacity>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
     </>
   );
 }
@@ -1043,16 +1270,13 @@ export default function MonthlyPhysiqueReportScreen() {
 /* -------------------------------------- */
 
 const styles = StyleSheet.create({
-  safe: {
-    flex: 1,
-    backgroundColor: colors.bg,
-  },
-  scroll: {
-    flex: 1,
-    paddingHorizontal: 16,
-  },
+  safe: { flex: 1, backgroundColor: colors.bg },
+  scroll: { flex: 1, paddingHorizontal: 16 },
+
+  center: { flex: 1, justifyContent: "center", alignItems: "center" },
+
   header: {
-    paddingTop: 36,
+    // NOTE: actual top padding is handled via ScrollView contentContainerStyle
     paddingBottom: 16,
   },
   headerTitle: {
@@ -1061,10 +1285,8 @@ const styles = StyleSheet.create({
     fontWeight: "800",
     marginBottom: 8,
   },
-  headerRow: {
-    flexDirection: "row",
-    alignItems: "center",
-  },
+  headerRow: { flexDirection: "row", alignItems: "center" },
+
   monthPill: {
     paddingHorizontal: 10,
     paddingVertical: 4,
@@ -1074,11 +1296,8 @@ const styles = StyleSheet.create({
     borderColor: "#203236",
     marginRight: 8,
   },
-  monthText: {
-    color: colors.dim,
-    fontSize: 12,
-    fontWeight: "600",
-  },
+  monthText: { color: colors.dim, fontSize: 12, fontWeight: "600" },
+
   trendPill: {
     flexDirection: "row",
     alignItems: "center",
@@ -1087,11 +1306,8 @@ const styles = StyleSheet.create({
     borderRadius: 999,
     backgroundColor: "#B8FF47",
   },
-  trendText: {
-    color: "#043315",
-    fontSize: 12,
-    fontWeight: "700",
-  },
+  trendText: { color: "#043315", fontSize: 12, fontWeight: "700" },
+
   card: {
     backgroundColor: colors.card,
     borderRadius: 16,
@@ -1106,15 +1322,13 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     marginBottom: 12,
   },
+
   angleRow: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
   },
-  photoSlot: {
-    flex: 1,
-    alignItems: "center",
-  },
+  photoSlot: { flex: 1, alignItems: "center" },
   photoInner: {
     width: width * 0.28,
     height: width * 0.45,
@@ -1126,43 +1340,16 @@ const styles = StyleSheet.create({
     alignItems: "center",
     overflow: "hidden",
   },
-  photoLabel: {
-    marginTop: 6,
-    color: colors.dim,
-    fontSize: 11,
-  },
-  arrowWrapper: {
-    width: 40,
-    alignItems: "center",
-  },
-  keyRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-  },
-  keyItem: {
-    flex: 1,
-    paddingVertical: 6,
-  },
-  keyLabel: {
-    color: colors.dim,
-    fontSize: 12,
-    marginBottom: 2,
-  },
-  keyValuePositive: {
-    color: colors.accent,
-    fontSize: 18,
-    fontWeight: "800",
-  },
-  keyValueNeutral: {
-    color: colors.text,
-    fontSize: 18,
-    fontWeight: "700",
-  },
-  muscleGrid: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    marginTop: 8,
-  },
+  photoLabel: { marginTop: 6, color: colors.dim, fontSize: 11 },
+  arrowWrapper: { width: 40, alignItems: "center" },
+
+  keyRow: { flexDirection: "row", justifyContent: "space-between" },
+  keyItem: { flex: 1, paddingVertical: 6 },
+  keyLabel: { color: colors.dim, fontSize: 12, marginBottom: 2 },
+  keyValuePositive: { color: colors.accent, fontSize: 18, fontWeight: "800" },
+  keyValueNeutral: { color: colors.text, fontSize: 18, fontWeight: "700" },
+
+  muscleGrid: { flexDirection: "row", flexWrap: "wrap", marginTop: 8 },
   muscleItem: {
     width: "48%",
     paddingVertical: 10,
@@ -1173,33 +1360,18 @@ const styles = StyleSheet.create({
     borderColor: "#212C31",
     backgroundColor: "#050B0D",
   },
-  muscleLabel: {
-    color: colors.dim,
-    fontSize: 12,
-    marginBottom: 4,
-  },
-  muscleValue: {
-    color: colors.accent,
-    fontSize: 16,
-    fontWeight: "800",
-  },
+  muscleLabel: { color: colors.dim, fontSize: 12, marginBottom: 4 },
+  muscleValue: { color: colors.accent, fontSize: 16, fontWeight: "800" },
+
   summaryRow: {
     flexDirection: "row",
     justifyContent: "space-between",
     paddingVertical: 6,
   },
-  summaryLabel: {
-    color: colors.dim,
-    fontSize: 13,
-  },
-  summaryValue: {
-    color: colors.text,
-    fontSize: 13,
-    fontWeight: "600",
-  },
-  shareWrapper: {
-    marginTop: 4,
-  },
+  summaryLabel: { color: colors.dim, fontSize: 13 },
+  summaryValue: { color: colors.text, fontSize: 13, fontWeight: "600" },
+
+  shareWrapper: { marginTop: 4 },
   shareButton: {
     width: "100%",
     borderRadius: 999,
@@ -1208,20 +1380,13 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-  shareText: {
-    color: "#00110A",
-    fontSize: 16,
-    fontWeight: "800",
-  },
+  shareText: { color: "#00110A", fontSize: 16, fontWeight: "800" },
   footerHint: {
     marginTop: 8,
     textAlign: "center",
     color: colors.dim,
     fontSize: 11,
   },
-  trainingHint: {
-    color: colors.dim,
-    fontSize: 12,
-    marginTop: 2,
-  },
+
+  trainingHint: { color: colors.dim, fontSize: 12, marginTop: 2 },
 });

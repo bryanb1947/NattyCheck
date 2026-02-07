@@ -48,3 +48,7 @@ ios/build/
 nattycheck-backend/
 **/__pycache__/
 **/*.pyc
+
+# Apple Sign In (DO NOT COMMIT)
+scripts/AuthKey.p8
+scripts/apple-jwt.js

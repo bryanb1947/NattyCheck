@@ -1,5 +1,4 @@
 // app/profile-edit.tsx
-
 import React, { useEffect, useState, useCallback } from "react";
 import {
   View,
@@ -30,10 +29,9 @@ const C = {
   accentB: "#00D9F5",
 };
 
-const gradient = [C.accentA, C.accentB];
+const gradient = [C.accentA, C.accentB] as const;
 
-// ----------------- helpers -----------------
-
+/* ----------------- helpers ----------------- */
 const imperialToCm = (ft: number, inch: number) => {
   const totalInches = ft * 12 + inch;
   return Math.round(totalInches * 2.54);
@@ -49,29 +47,34 @@ const cmToImperial = (cm: number) => {
 const lbToKg = (lb: number) => Math.round(lb * 0.453592);
 const kgToLb = (kg: number) => Math.round(kg / 0.453592);
 
+type ToneMode = "Savage" | "Pro" | "Adaptive";
+type Equipment = "Gym" | "Bodyweight" | "Hybrid";
+
 export default function ProfileEditScreen() {
   const router = useRouter();
 
-  const { userId, email, plan, persist, setUser } = useAuthStore();
-  const hasHydratedAuth = persist?.hasHydrated?.() ?? true;
+  // ✅ canonical auth store fields/actions (no plan here)
+  const userId = useAuthStore((s) => s.userId);
+  const email = useAuthStore((s) => s.email);
+  const setIdentity = useAuthStore((s) => s.setIdentity);
+
+  // ✅ correct hydration check for persisted Zustand store
+  const hasHydratedAuth = useAuthStore.persist.hasHydrated();
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
-  // -------- account fields (email + password) --------
+  /* -------- account fields (email + password) -------- */
   const [emailInput, setEmailInput] = useState(email ?? "");
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
 
-  // keep email field in sync when auth store changes
   useEffect(() => {
     setEmailInput(email ?? "");
   }, [email]);
 
-  // -------- training / preference fields --------
-
-  // units
+  /* -------- training / preference fields -------- */
   const [metric, setMetric] = useState(false); // false = imperial, true = metric
 
   // imperial
@@ -84,34 +87,57 @@ export default function ProfileEditScreen() {
   const [weightKg, setWeightKg] = useState(80);
 
   const [goal, setGoal] = useState<string>("Gain Muscle");
-  const [equipment, setEquipment] = useState<"Gym" | "Bodyweight" | "Hybrid">(
-    "Gym"
-  );
+  const [equipment, setEquipment] = useState<Equipment>("Gym");
   const [activity, setActivity] = useState<string>("Moderate");
   const [experience, setExperience] = useState<string>("Beginner");
-  const [toneMode, setToneMode] =
-    useState<"Savage" | "Pro" | "Adaptive">("Savage");
+  const [toneMode, setToneMode] = useState<ToneMode>("Savage");
 
-  // ----------------- load profile from Supabase.profiles -----------------
-
+  /* ----------------- load profile from Supabase.profiles ----------------- */
   const loadProfile = useCallback(async () => {
-    if (!userId) {
-      router.replace("/login");
-      return;
-    }
-
     try {
       setLoading(true);
 
+      // Always prefer session user (avoids stale store on cold start)
+      const { data: sessData, error: sessErr } = await supabase.auth.getSession();
+      if (sessErr) console.log("Profile edit getSession error:", sessErr);
+
+      const sessionUser = sessData?.session?.user ?? null;
+      const uid = sessionUser?.id ?? userId ?? null;
+      const em = sessionUser?.email ?? email ?? null;
+
+      if (!uid) {
+        router.replace("/login");
+        return;
+      }
+
+      if (em) setIdentity({ userId: uid, email: em });
+
       const { data, error } = await supabase
         .from("profiles")
-        .select("*")
-        .eq("user_id", userId)
-        .single();
+        .select(
+          [
+            "user_id",
+            "email",
+            "unit_system",
+            "height_cm",
+            "weight_kg",
+            "goal",
+            "equipment",
+            "activity_level",
+            "experience_level",
+            "tone_mode",
+          ].join(",")
+        )
+        .eq("user_id", uid)
+        .maybeSingle();
 
       if (error) {
-        console.log("Profile edit load error:", error.message);
-        setLoading(false);
+        console.log("Profile edit load error:", error);
+        return;
+      }
+
+      if (!data) {
+        // No row → leave defaults (ensureProfile should normally prevent this)
         return;
       }
 
@@ -122,42 +148,41 @@ export default function ProfileEditScreen() {
       const dbHeightCm = data.height_cm ?? 178;
       const dbWeightKg = data.weight_kg ?? 80;
 
-      // metric state
       setHeightCm(dbHeightCm);
       setWeightKg(dbWeightKg);
 
-      // imperial derived
       const { ft, inch } = cmToImperial(dbHeightCm);
       setHeightFt(ft);
       setHeightInch(inch);
       setWeightLb(kgToLb(dbWeightKg));
 
       setGoal(data.goal ?? "Gain Muscle");
-      setEquipment(
-        (data.equipment as "Gym" | "Bodyweight" | "Hybrid") ?? "Gym"
-      );
+      setEquipment((data.equipment as Equipment) ?? "Gym");
       setActivity(data.activity_level ?? "Moderate");
       setExperience(data.experience_level ?? "Beginner");
-      setToneMode(
-        (data.tone_mode as "Savage" | "Pro" | "Adaptive") ?? "Savage"
-      );
+      setToneMode((data.tone_mode as ToneMode) ?? "Savage");
+
+      // keep local email input aligned with DB if it exists
+      if (typeof data.email === "string" && data.email.length > 0) {
+        setEmailInput(data.email);
+      }
     } catch (err) {
       console.log("Profile edit load exception:", err);
     } finally {
       setLoading(false);
     }
-  }, [userId, router]);
+  }, [router, userId, email, setIdentity]);
 
   useEffect(() => {
     if (!hasHydratedAuth) return;
     loadProfile();
   }, [hasHydratedAuth, loadProfile]);
 
-  // ----------------- unit toggle -----------------
-
+  /* ----------------- unit toggle ----------------- */
   const toggleMetric = () => {
     setMetric((prev) => {
       const next = !prev;
+
       if (next) {
         // going → metric
         const cm = imperialToCm(heightFt, heightInch);
@@ -172,64 +197,76 @@ export default function ProfileEditScreen() {
         setHeightInch(inch);
         setWeightLb(lb);
       }
+
       return next;
     });
   };
 
-  // ----------------- save profile (account + training) -----------------
-
+  /* ----------------- save profile (account + training) ----------------- */
   const handleSave = async () => {
-    if (!userId) return;
-
-    const trimmedEmail = (emailInput || "").trim();
-    const currentEmail = email ?? "";
-    const emailChanged =
-      trimmedEmail.length > 0 && trimmedEmail.toLowerCase() !== currentEmail.toLowerCase();
-
-    const anyPasswordEntered =
-      currentPassword.length > 0 ||
-      newPassword.length > 0 ||
-      confirmPassword.length > 0;
-
-    // basic validation BEFORE hitting Supabase
-    if (anyPasswordEntered) {
-      if (!currentPassword || !newPassword || !confirmPassword) {
-        Alert.alert(
-          "Update password",
-          "Please fill in current password, new password, and confirmation."
-        );
-        return;
-      }
-
-      if (newPassword.length < 8) {
-        Alert.alert(
-          "New password too short",
-          "For security, your new password should be at least 8 characters."
-        );
-        return;
-      }
-
-      if (newPassword !== confirmPassword) {
-        Alert.alert(
-          "Passwords don’t match",
-          "Your new password and confirmation must match."
-        );
-        return;
-      }
-    }
-
-    if (emailChanged && !trimmedEmail.includes("@")) {
-      Alert.alert("Invalid email", "Please enter a valid email address.");
-      return;
-    }
-
-    setSaving(true);
-
     try {
+      setSaving(true);
+
+      const { data: sessData } = await supabase.auth.getSession();
+      const sessionUser = sessData?.session?.user ?? null;
+      const uid = sessionUser?.id ?? userId ?? null;
+
+      if (!uid) {
+        Alert.alert("Not signed in", "Please log in again.");
+        router.replace("/login");
+        return;
+      }
+
+      const trimmedEmail = (emailInput || "").trim().toLowerCase();
+      const currentEmail = (sessionUser?.email ?? email ?? "").trim().toLowerCase();
+
+      const emailChanged =
+        trimmedEmail.length > 0 &&
+        currentEmail.length > 0 &&
+        trimmedEmail !== currentEmail;
+
+      const anyPasswordEntered =
+        currentPassword.length > 0 ||
+        newPassword.length > 0 ||
+        confirmPassword.length > 0;
+
+      // basic validation BEFORE hitting Supabase
+      if (anyPasswordEntered) {
+        if (!currentPassword || !newPassword || !confirmPassword) {
+          Alert.alert(
+            "Update password",
+            "Please fill in current password, new password, and confirmation."
+          );
+          return;
+        }
+
+        if (newPassword.length < 8) {
+          Alert.alert(
+            "New password too short",
+            "For security, your new password should be at least 8 characters."
+          );
+          return;
+        }
+
+        if (newPassword !== confirmPassword) {
+          Alert.alert(
+            "Passwords don’t match",
+            "Your new password and confirmation must match."
+          );
+          return;
+        }
+      }
+
+      if (emailChanged && !trimmedEmail.includes("@")) {
+        Alert.alert("Invalid email", "Please enter a valid email address.");
+        return;
+      }
+
       const unit_system = metric ? "metric" : "imperial";
       const height_cm = metric ? heightCm : imperialToCm(heightFt, heightInch);
       const weight_kg = metric ? weightKg : lbToKg(weightLb);
 
+      // 1) Update training profile columns that actually exist
       const profilePayload: Record<string, any> = {
         unit_system,
         height_cm,
@@ -242,28 +279,34 @@ export default function ProfileEditScreen() {
         updated_at: new Date().toISOString(),
       };
 
-      // 1) Update training profile
+      // If user typed an email, keep profiles.email in sync too
+      if (trimmedEmail.includes("@")) {
+        profilePayload.email = trimmedEmail;
+      }
+
       const { error: profileError } = await supabase
         .from("profiles")
         .update(profilePayload)
-        .eq("user_id", userId);
+        .eq("user_id", uid);
 
       if (profileError) {
-        console.log("❌ Profile edit update error:", profileError.message);
+        console.log("❌ Profile edit update error:", profileError);
         Alert.alert(
           "Couldn’t save profile",
           "Something went wrong updating your training profile. Please try again."
         );
-        setSaving(false);
         return;
       }
 
       // 2) Update auth email / password if needed
-      let newEmailForStore = currentEmail;
-
       if (emailChanged || anyPasswordEntered) {
         // If changing password, verify current password first
         if (anyPasswordEntered) {
+          if (!currentEmail) {
+            Alert.alert("Error", "No current email found for this session.");
+            return;
+          }
+
           const { error: verifyError } = await supabase.auth.signInWithPassword({
             email: currentEmail,
             password: currentPassword,
@@ -275,19 +318,13 @@ export default function ProfileEditScreen() {
               "Current password incorrect",
               "We couldn’t verify your current password. Please try again."
             );
-            setSaving(false);
             return;
           }
         }
 
         const authPayload: { email?: string; password?: string } = {};
-        if (emailChanged) {
-          authPayload.email = trimmedEmail;
-          newEmailForStore = trimmedEmail;
-        }
-        if (anyPasswordEntered) {
-          authPayload.password = newPassword;
-        }
+        if (emailChanged) authPayload.email = trimmedEmail;
+        if (anyPasswordEntered) authPayload.password = newPassword;
 
         const { error: authError } = await supabase.auth.updateUser(authPayload);
 
@@ -295,18 +332,17 @@ export default function ProfileEditScreen() {
           console.log("❌ Auth update error:", authError.message);
           Alert.alert(
             "Account update issue",
-            "We updated your training profile, but couldn’t update your login details. Please double-check your info and try again."
+            "We saved your training profile, but couldn’t update your login details. Please double-check your info and try again."
           );
-          // still proceed to update local store with old email
+          // still continue — training profile was saved
+        } else {
+          // If auth email changed successfully, update store identity
+          if (emailChanged) setIdentity({ userId: uid, email: trimmedEmail });
         }
+      } else {
+        // No auth changes; still ensure identity is correct
+        setIdentity({ userId: uid, email: sessionUser?.email ?? email ?? null });
       }
-
-      // 3) Keep auth store in sync
-      setUser({
-        userId,
-        email: newEmailForStore,
-        plan: plan ?? "free",
-      });
 
       router.back();
     } catch (err) {
@@ -320,8 +356,7 @@ export default function ProfileEditScreen() {
     }
   };
 
-  // ----------------- header (matches monthly-report) -----------------
-
+  /* ----------------- header ----------------- */
   const header = (
     <Stack.Screen
       options={{
@@ -342,8 +377,7 @@ export default function ProfileEditScreen() {
     />
   );
 
-  // ----------------- render states -----------------
-
+  /* ----------------- render states ----------------- */
   if (!hasHydratedAuth || loading) {
     return (
       <>
@@ -374,8 +408,7 @@ export default function ProfileEditScreen() {
     );
   }
 
-  // ----------------- main render -----------------
-
+  /* ----------------- main render ----------------- */
   return (
     <>
       {header}
@@ -386,12 +419,12 @@ export default function ProfileEditScreen() {
           contentContainerStyle={{ paddingBottom: 32 }}
           showsVerticalScrollIndicator={false}
         >
-          {/* HEADER TEXT (scrolls away) */}
+          {/* HEADER TEXT */}
           <View style={styles.header}>
             <Text style={styles.headerTitle}>Training Profile</Text>
             <Text style={styles.headerSubtitle}>
-              Update your stats, preferences, and login so NattyCheck can dial
-              in your analysis and plans.
+              Update your stats, preferences, and login so NattyCheck can dial in
+              your analysis and plans.
             </Text>
           </View>
 
@@ -454,8 +487,8 @@ export default function ProfileEditScreen() {
             />
 
             <Text style={styles.inputHint}>
-              Leave password fields blank if you only want to update your
-              physique + training settings.
+              Leave password fields blank if you only want to update your physique
+              + training settings.
             </Text>
           </View>
 
@@ -468,12 +501,7 @@ export default function ProfileEditScreen() {
 
             {/* Unit toggle */}
             <View style={styles.unitRow}>
-              <Text
-                style={[
-                  styles.unitLabel,
-                  !metric ? styles.unitLabelActive : null,
-                ]}
-              >
+              <Text style={[styles.unitLabel, !metric ? styles.unitLabelActive : null]}>
                 Imperial
               </Text>
 
@@ -486,12 +514,7 @@ export default function ProfileEditScreen() {
                 />
               </TouchableOpacity>
 
-              <Text
-                style={[
-                  styles.unitLabel,
-                  metric ? styles.unitLabelActive : null,
-                ]}
-              >
+              <Text style={[styles.unitLabel, metric ? styles.unitLabelActive : null]}>
                 Metric
               </Text>
             </View>
@@ -581,35 +604,23 @@ export default function ProfileEditScreen() {
                   onPress={() => setGoal(g)}
                   style={[styles.option, selected && styles.optionSelected]}
                 >
-                  <Text
-                    style={[
-                      styles.optionText,
-                      selected && styles.optionTextSelected,
-                    ]}
-                  >
+                  <Text style={[styles.optionText, selected && styles.optionTextSelected]}>
                     {g}
                   </Text>
                 </TouchableOpacity>
               );
             })}
 
-            <Text style={[styles.fieldLabel, { marginTop: 12 }]}>
-              Equipment
-            </Text>
+            <Text style={[styles.fieldLabel, { marginTop: 12 }]}>Equipment</Text>
             {["Gym", "Bodyweight", "Hybrid"].map((eq) => {
-              const selected = equipment === (eq as any);
+              const selected = equipment === (eq as Equipment);
               return (
                 <TouchableOpacity
                   key={eq}
-                  onPress={() => setEquipment(eq as "Gym" | "Bodyweight" | "Hybrid")}
+                  onPress={() => setEquipment(eq as Equipment)}
                   style={[styles.option, selected && styles.optionSelected]}
                 >
-                  <Text
-                    style={[
-                      styles.optionText,
-                      selected && styles.optionTextSelected,
-                    ]}
-                  >
+                  <Text style={[styles.optionText, selected && styles.optionTextSelected]}>
                     {eq}
                   </Text>
                 </TouchableOpacity>
@@ -622,32 +633,27 @@ export default function ProfileEditScreen() {
             <Text style={styles.cardTitle}>Activity & Experience</Text>
 
             <Text style={styles.fieldLabel}>Activity level</Text>
-            {[
-              "Sedentary",
-              "Light",
-              "Moderate",
-              "Active",
-              "Very Active",
-              "Athlete",
-            ].map((lvl) => {
-              const selected = activity === lvl;
-              return (
-                <TouchableOpacity
-                  key={lvl}
-                  onPress={() => setActivity(lvl)}
-                  style={[styles.option, selected && styles.optionSelected]}
-                >
-                  <Text
-                    style={[
-                      styles.optionText,
-                      selected && styles.optionTextSelected,
-                    ]}
+            {["Sedentary", "Light", "Moderate", "Active", "Very Active", "Athlete"].map(
+              (lvl) => {
+                const selected = activity === lvl;
+                return (
+                  <TouchableOpacity
+                    key={lvl}
+                    onPress={() => setActivity(lvl)}
+                    style={[styles.option, selected && styles.optionSelected]}
                   >
-                    {lvl}
-                  </Text>
-                </TouchableOpacity>
-              );
-            })}
+                    <Text
+                      style={[
+                        styles.optionText,
+                        selected && styles.optionTextSelected,
+                      ]}
+                    >
+                      {lvl}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              }
+            )}
 
             <Text style={[styles.fieldLabel, { marginTop: 12 }]}>
               Training experience
@@ -660,12 +666,7 @@ export default function ProfileEditScreen() {
                   onPress={() => setExperience(lvl)}
                   style={[styles.option, selected && styles.optionSelected]}
                 >
-                  <Text
-                    style={[
-                      styles.optionText,
-                      selected && styles.optionTextSelected,
-                    ]}
-                  >
+                  <Text style={[styles.optionText, selected && styles.optionTextSelected]}>
                     {lvl}
                   </Text>
                 </TouchableOpacity>
@@ -692,12 +693,7 @@ export default function ProfileEditScreen() {
                   onPress={() => setToneMode(m.key)}
                   style={[styles.option, selected && styles.optionSelected]}
                 >
-                  <Text
-                    style={[
-                      styles.optionText,
-                      selected && styles.optionTextSelected,
-                    ]}
-                  >
+                  <Text style={[styles.optionText, selected && styles.optionTextSelected]}>
                     {m.label}
                   </Text>
                 </TouchableOpacity>
@@ -706,11 +702,7 @@ export default function ProfileEditScreen() {
           </View>
 
           {/* SAVE BUTTON */}
-          <TouchableOpacity
-            style={{ marginTop: 4 }}
-            onPress={handleSave}
-            disabled={saving}
-          >
+          <TouchableOpacity style={{ marginTop: 4 }} onPress={handleSave} disabled={saving}>
             <LinearGradient colors={gradient} style={styles.saveBtn}>
               {saving ? (
                 <ActivityIndicator color="#000" />
@@ -726,26 +718,17 @@ export default function ProfileEditScreen() {
 }
 
 /* ----------------- styles ----------------- */
-
 const styles = StyleSheet.create({
-  safe: {
-    flex: 1,
-    backgroundColor: C.bg,
-  },
-  scroll: {
-    flex: 1,
-    paddingHorizontal: 16,
-  },
+  safe: { flex: 1, backgroundColor: C.bg },
+  scroll: { flex: 1, paddingHorizontal: 16 },
+
   loadingWrap: {
     flex: 1,
     justifyContent: "center",
     alignItems: "center",
     paddingHorizontal: 24,
   },
-  loadingText: {
-    color: C.dim,
-    marginTop: 8,
-  },
+  loadingText: { color: C.dim, marginTop: 8 },
   signInTitle: {
     color: C.text,
     fontSize: 18,
@@ -753,26 +736,16 @@ const styles = StyleSheet.create({
     marginBottom: 6,
     textAlign: "center",
   },
-  signInText: {
-    color: C.dim,
-    textAlign: "center",
-    fontSize: 13,
-  },
+  signInText: { color: C.dim, textAlign: "center", fontSize: 13 },
 
-  header: {
-    paddingTop: 36,
-    paddingBottom: 16,
-  },
+  header: { paddingTop: 36, paddingBottom: 16 },
   headerTitle: {
     color: C.text,
     fontSize: 22,
     fontWeight: "800",
     marginBottom: 6,
   },
-  headerSubtitle: {
-    color: C.dim,
-    fontSize: 13,
-  },
+  headerSubtitle: { color: C.dim, fontSize: 13 },
 
   card: {
     backgroundColor: C.card,
@@ -788,11 +761,7 @@ const styles = StyleSheet.create({
     fontWeight: "800",
     marginBottom: 6,
   },
-  cardSubtitle: {
-    color: C.dim,
-    fontSize: 12,
-    marginBottom: 10,
-  },
+  cardSubtitle: { color: C.dim, fontSize: 12, marginBottom: 10 },
 
   unitRow: {
     flexDirection: "row",
@@ -800,14 +769,8 @@ const styles = StyleSheet.create({
     marginTop: 8,
     marginBottom: 12,
   },
-  unitLabel: {
-    color: "#566268",
-    fontSize: 13,
-    fontWeight: "600",
-  },
-  unitLabelActive: {
-    color: C.text,
-  },
+  unitLabel: { color: "#566268", fontSize: 13, fontWeight: "600" },
+  unitLabelActive: { color: C.text },
   switchOuter: {
     width: 52,
     height: 28,
@@ -824,12 +787,8 @@ const styles = StyleSheet.create({
     position: "absolute",
     top: 3,
   },
-  switchThumbLeft: {
-    left: 3,
-  },
-  switchThumbRight: {
-    right: 3,
-  },
+  switchThumbLeft: { left: 3 },
+  switchThumbRight: { right: 3 },
 
   fieldLabel: {
     color: C.dim,
@@ -839,10 +798,7 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
 
-  row: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-  },
+  row: { flexDirection: "row", justifyContent: "space-between" },
   pickerContainer: {
     flex: 1,
     marginRight: 6,
@@ -859,10 +815,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     overflow: "hidden",
   },
-  picker: {
-    color: C.text,
-    height: 150,
-  },
+  picker: { color: C.text, height: 150 },
 
   option: {
     backgroundColor: "#10171A",
@@ -873,18 +826,9 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "transparent",
   },
-  optionSelected: {
-    backgroundColor: C.accentA,
-    borderColor: C.accentA,
-  },
-  optionText: {
-    color: C.text,
-    fontSize: 14,
-    fontWeight: "600",
-  },
-  optionTextSelected: {
-    color: "#000",
-  },
+  optionSelected: { backgroundColor: C.accentA, borderColor: C.accentA },
+  optionText: { color: C.text, fontSize: 14, fontWeight: "600" },
+  optionTextSelected: { color: "#000" },
 
   input: {
     backgroundColor: "#0B1114",
@@ -896,11 +840,7 @@ const styles = StyleSheet.create({
     color: C.text,
     fontSize: 14,
   },
-  inputHint: {
-    marginTop: 8,
-    color: C.dim,
-    fontSize: 11,
-  },
+  inputHint: { marginTop: 8, color: C.dim, fontSize: 11 },
 
   saveBtn: {
     width: "100%",
@@ -909,10 +849,5 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-  saveText: {
-    color: "#00110A",
-    fontSize: 16,
-    fontWeight: "800",
-  },
+  saveText: { color: "#00110A", fontSize: 16, fontWeight: "800" },
 });
- 

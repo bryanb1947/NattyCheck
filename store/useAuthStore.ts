@@ -2,83 +2,463 @@
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { supabase } from "@/lib/supabase";
 
 /* ---------------------------------------------
    TYPES
 --------------------------------------------- */
-export type PlanType = "free" | "trial" | "pro";
+export type PlanType = "free" | "pro";
+
+type SetUserInput =
+  | {
+      id: string;
+      email?: string | null;
+    }
+  | null;
 
 type AuthState = {
-  userId?: string;
-  email?: string;
+  // Supabase session user
+  userId: string | null;
+  email: string | null;
 
-  // CACHE ONLY — DB is source of truth
+  // Gate fields (DB is source of truth)
   plan: PlanType;
+  onboardingComplete: boolean;
 
+  // UX flags
+  didPromptSaveProgress: boolean;
+
+  // Boot flags
   hasHydrated: boolean;
+  hasBootstrappedSession: boolean;
 
-  setIdentity: (args: { userId: string; email?: string }) => void;
-  setPlan: (plan: PlanType) => void;
-  logout: () => void;
-
+  // Actions
   setHydrated: () => void;
+  setIdentity: (args: { userId: string; email?: string | null }) => void;
+  setUser: (user: SetUserInput) => void;
+
+  setPlan: (plan: PlanType) => void;
+  setOnboardingComplete: (v: boolean) => void;
+
+  setDidPromptSaveProgress: (v: boolean) => void;
+
+  // Boot
+  bootstrapAuth: () => Promise<void>; // restore only (NO anon)
+  ensureGuestSession: () => Promise<void>; // explicit anon creation when user hits "Get Started"
+  startAuthListener: () => void;
+  stopAuthListener: () => void;
+
+  // Logout
+  logoutToLanding: () => Promise<void>; // signOut -> go back to landing state (no anon auto-create)
+  hardReset: () => Promise<void>; // wipe persisted auth
 };
 
+let authUnsub: (() => void) | null = null;
+
+let ensureSessionInFlight: Promise<{
+  userId: string | null;
+  email: string | null;
+  source: "existing" | "anon" | "none";
+}> | null = null;
+
+/* ---------------------------------------------
+   HELPERS
+--------------------------------------------- */
+function sanitizePlan(v: any): PlanType {
+  const s = String(v ?? "").trim().toLowerCase();
+  return s === "pro" ? "pro" : "free";
+}
+
+function normalizeProfileToProOrFree(profile: any): PlanType {
+  const norm = String(profile?.plan_normalized ?? "").trim().toLowerCase();
+  if (norm === "pro" || norm === "premium" || norm === "paid" || norm === "plus") return "pro";
+
+  const raw = String(profile?.plan_raw ?? "").trim().toLowerCase();
+  if (raw.includes("appstore:") || raw.includes("revenuecat:")) return "pro";
+
+  return "free";
+}
+
+/**
+ * Restore session if exists.
+ * If allowAnonymous=true and none exists => create anon.
+ *
+ * IMPORTANT: allowAnonymous defaults to FALSE now.
+ */
+async function ensureSupabaseSession(opts?: { allowAnonymous?: boolean }) {
+  if (ensureSessionInFlight) return ensureSessionInFlight;
+
+  const allowAnonymous = opts?.allowAnonymous === true;
+
+  ensureSessionInFlight = (async () => {
+    // 1) restore existing
+    try {
+      const { data, error } = await supabase.auth.getSession();
+      if (error) console.log("🟦 Supabase getSession error:", error.message);
+
+      const session = data?.session ?? null;
+      if (session?.user?.id) {
+        return {
+          userId: session.user.id,
+          email: session.user.email ?? null,
+          source: "existing" as const,
+        };
+      }
+    } catch (e: any) {
+      console.log("🟦 getSession crash:", e?.message ?? e);
+    }
+
+    // 2) optionally create anon
+    if (!allowAnonymous) {
+      return { userId: null, email: null, source: "none" as const };
+    }
+
+    try {
+      const { data, error } = await supabase.auth.signInAnonymously();
+      if (error) {
+        console.log("🟦 signInAnonymously error:", error.message);
+        return { userId: null, email: null, source: "none" as const };
+      }
+
+      const u = data?.user ?? null;
+      if (u?.id) {
+        console.log("🟩 Anonymous session created:", { uid: u.id });
+        return {
+          userId: u.id,
+          email: u.email ?? null,
+          source: "anon" as const,
+        };
+      }
+    } catch (e: any) {
+      console.log("🟦 signInAnonymously crash:", e?.message ?? e);
+    }
+
+    return { userId: null, email: null, source: "none" as const };
+  })();
+
+  try {
+    return await ensureSessionInFlight;
+  } finally {
+    ensureSessionInFlight = null;
+  }
+}
+
+/**
+ * Ensure profiles row exists WITHOUT overwriting plan fields.
+ * - If row missing => insert with free defaults
+ * - If row exists => optionally update email (only if different)
+ *
+ * CRITICAL: do NOT write plan_normalized/plan_raw on existing rows.
+ */
+async function ensureProfileRow(userId: string, email: string | null) {
+  try {
+    const { data: existing, error: selErr } = await supabase
+      .from("profiles")
+      .select("user_id, email")
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (selErr) {
+      console.log("🟨 profiles select error (non-fatal):", selErr.message);
+      return;
+    }
+
+    if (!existing?.user_id) {
+      const { error: insErr } = await supabase.from("profiles").insert({
+        user_id: userId,
+        email: email ?? null,
+        plan_normalized: "free",
+        plan_raw: "free",
+      });
+
+      if (insErr) console.log("🟨 profiles insert error (non-fatal):", insErr.message);
+      else console.log("✅ profiles row created for user:", userId);
+      return;
+    }
+
+    // If row exists, update email only when needed.
+    const existingEmail = (existing?.email ?? null) as string | null;
+    const incomingEmail = email ?? null;
+
+    if (incomingEmail && incomingEmail !== existingEmail) {
+      const { error: upErr } = await supabase
+        .from("profiles")
+        .update({ email: incomingEmail })
+        .eq("user_id", userId);
+
+      if (upErr) console.log("🟨 profiles email update error (non-fatal):", upErr.message);
+      else console.log("✅ profiles email updated:", userId);
+    } else {
+      console.log("✅ profiles row ensured for user:", userId);
+    }
+  } catch (e: any) {
+    console.log("🟨 ensureProfileRow crash (non-fatal):", e?.message ?? e);
+  }
+}
+
+/**
+ * Pull gate fields from DB
+ */
+async function fetchProfileGate(userId: string): Promise<{
+  plan: PlanType;
+  onboardingComplete: boolean;
+  email: string | null;
+}> {
+  try {
+    const { data: profile, error } = await supabase
+      .from("profiles")
+      .select("email, plan_normalized, plan_raw, onboarding_complete")
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (error) {
+      console.log("🟨 profiles fetch error (non-fatal):", error.message);
+      return { plan: "free", onboardingComplete: false, email: null };
+    }
+
+    return {
+      plan: normalizeProfileToProOrFree(profile),
+      onboardingComplete: !!profile?.onboarding_complete,
+      email: (profile?.email ?? null) as string | null,
+    };
+  } catch (e: any) {
+    console.log("🟨 fetchProfileGate crash (non-fatal):", e?.message ?? e);
+    return { plan: "free", onboardingComplete: false, email: null };
+  }
+}
+
+/* ---------------------------------------------
+   STORE
+--------------------------------------------- */
 export const useAuthStore = create<AuthState>()(
   persist(
-    (set) => ({
-      userId: undefined,
-      email: undefined,
+    (set, get) => ({
+      userId: null,
+      email: null,
+
       plan: "free",
+      onboardingComplete: false,
+
+      // NEW: one-time save prompt flag
+      didPromptSaveProgress: false,
+
       hasHydrated: false,
+      hasBootstrappedSession: false,
 
       setHydrated: () => set({ hasHydrated: true }),
 
       setIdentity: ({ userId, email }) =>
+        set((state) => ({ userId, email: email ?? state.email })),
+
+      setUser: (user) => {
+        if (!user) {
+          set({
+            userId: null,
+            email: null,
+            plan: "free",
+            onboardingComplete: false,
+          });
+          return;
+        }
+
         set((state) => ({
-          userId,
-          email: email ?? state.email,
-        })),
+          userId: user.id,
+          email: user.email ?? state.email,
+        }));
+      },
 
-      setPlan: (plan) => set({ plan }),
+      setPlan: (plan) => set({ plan: sanitizePlan(plan) }),
+      setOnboardingComplete: (v) => set({ onboardingComplete: !!v }),
 
-      logout: () =>
+      setDidPromptSaveProgress: (v) => set({ didPromptSaveProgress: !!v }),
+
+      /**
+       * Restore-only bootstrap (NO anon creation)
+       */
+      bootstrapAuth: async () => {
+        try {
+          const { userId, email, source } = await ensureSupabaseSession({ allowAnonymous: false });
+
+          if (!userId) {
+            console.log("🟦 No Supabase session found (restore-only).");
+            set({
+              userId: null,
+              email: null,
+              plan: "free",
+              onboardingComplete: false,
+              hasBootstrappedSession: true,
+            });
+            return;
+          }
+
+          console.log("🟩 Supabase session restored:", { uid: userId, em: email ?? "", source });
+
+          await ensureProfileRow(userId, email);
+
+          const gate = await fetchProfileGate(userId);
+
+          set((state) => ({
+            userId,
+            email: email ?? gate.email ?? state.email,
+            plan: gate.plan,
+            onboardingComplete: gate.onboardingComplete,
+            hasBootstrappedSession: true,
+          }));
+        } catch (e: any) {
+          console.log("🟦 bootstrapAuth crash:", e?.message ?? e);
+          set({
+            userId: null,
+            email: null,
+            plan: "free",
+            onboardingComplete: false,
+            hasBootstrappedSession: true,
+          });
+        }
+      },
+
+      /**
+       * Explicit anon creation (call ONLY when user hits Get Started / first scan)
+       */
+      ensureGuestSession: async () => {
+        try {
+          // If already have a session, do nothing
+          const existing = await ensureSupabaseSession({ allowAnonymous: false });
+          if (existing.userId) {
+            console.log("🟦 GuestSession skipped: session already exists.");
+            return;
+          }
+
+          const created = await ensureSupabaseSession({ allowAnonymous: true });
+          if (!created.userId) {
+            console.log("🟦 GuestSession failed: no user created.");
+            return;
+          }
+
+          await ensureProfileRow(created.userId, created.email);
+
+          const gate = await fetchProfileGate(created.userId);
+
+          set({
+            userId: created.userId,
+            email: created.email ?? gate.email,
+            plan: gate.plan,
+            onboardingComplete: gate.onboardingComplete,
+            hasBootstrappedSession: true,
+          });
+        } catch (e: any) {
+          console.log("🟦 ensureGuestSession crash:", e?.message ?? e);
+        }
+      },
+
+      startAuthListener: () => {
+        if (authUnsub) return;
+
+        const { data } = supabase.auth.onAuthStateChange(async (_event, session) => {
+          const user = session?.user ?? null;
+
+          if (!user?.id) {
+            console.log("🟦 Auth change: signed out");
+
+            // IMPORTANT: do NOT auto-create anon here anymore.
+            set({
+              userId: null,
+              email: null,
+              plan: "free",
+              onboardingComplete: false,
+              hasBootstrappedSession: true,
+            });
+            return;
+          }
+
+          console.log("🟩 Auth change: signed in", { email: user.email ?? "", uid: user.id });
+
+          await ensureProfileRow(user.id, user.email ?? null);
+
+          const gate = await fetchProfileGate(user.id);
+
+          set({
+            userId: user.id,
+            email: (user.email ?? gate.email ?? null) as any,
+            plan: gate.plan,
+            onboardingComplete: gate.onboardingComplete,
+            hasBootstrappedSession: true,
+          });
+        });
+
+        authUnsub = () => data.subscription.unsubscribe();
+      },
+
+      stopAuthListener: () => {
+        if (authUnsub) {
+          authUnsub();
+          authUnsub = null;
+        }
+      },
+
+      /**
+       * Sign out and return to landing (no anon auto-create)
+       */
+      logoutToLanding: async () => {
+        try {
+          await supabase.auth.signOut();
+        } catch {}
+
         set({
-          userId: undefined,
-          email: undefined,
+          userId: null,
+          email: null,
           plan: "free",
-        }),
+          onboardingComplete: false,
+          hasBootstrappedSession: true,
+        });
+      },
+
+      /**
+       * Hard reset: wipe persisted auth store
+       */
+      hardReset: async () => {
+        try {
+          await supabase.auth.signOut();
+        } catch {}
+
+        try {
+          await AsyncStorage.removeItem("auth");
+        } catch {}
+
+        set({
+          userId: null,
+          email: null,
+          plan: "free",
+          onboardingComplete: false,
+          didPromptSaveProgress: false,
+          hasHydrated: true,
+          hasBootstrappedSession: true,
+        });
+      },
     }),
     {
       name: "auth",
-      version: 3,
+      version: 101, // bump because we added didPromptSaveProgress
       storage: createJSONStorage(() => AsyncStorage),
 
-      migrate: (persistedState: any) => {
-        if (!persistedState || typeof persistedState !== "object") {
-          return {
-            userId: undefined,
-            email: undefined,
-            plan: "free",
-            hasHydrated: false,
-          };
-        }
+      // Persist only stable UI/state (NOT identity)
+      partialize: (state) => ({
+        plan: state.plan,
+        onboardingComplete: state.onboardingComplete,
+        didPromptSaveProgress: state.didPromptSaveProgress,
+      }),
 
-        const raw = persistedState.plan;
-
-        const normalizedPlan: PlanType =
-          raw === "pro" ? "pro" : raw === "trial" ? "trial" : "free";
-
-        return {
-          userId: persistedState.userId,
-          email: persistedState.email,
-          plan: normalizedPlan,
-          hasHydrated: false,
-        };
-      },
+      migrate: (persistedState: any) => ({
+        userId: null,
+        email: null,
+        plan: sanitizePlan(persistedState?.plan),
+        onboardingComplete: !!persistedState?.onboardingComplete,
+        didPromptSaveProgress: !!persistedState?.didPromptSaveProgress,
+        hasHydrated: false,
+        hasBootstrappedSession: false,
+      }),
 
       onRehydrateStorage: () => (state) => {
-        state?.setHydrated();
+        state?.setHydrated?.();
       },
     }
   )
