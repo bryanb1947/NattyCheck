@@ -24,6 +24,10 @@ export default ({ config }) => {
       ...(config.ios ?? {}),
       bundleIdentifier: iosBundleId,
       buildNumber: IOS_BUILD_NUMBER,
+
+      // ✅ REQUIRED for native "Sign in with Apple" sheet (Face ID UI)
+      // Prevents web redirect OAuth flow and enables the native capability.
+      usesAppleSignIn: true,
     },
 
     android: {

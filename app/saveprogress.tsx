@@ -31,6 +31,8 @@ const C = {
   googleBorder: "rgba(10,11,12,0.12)",
 };
 
+type BusyState = null | "apple" | "google" | "finishing";
+
 function normalizeRoute(v: string) {
   const raw = String(v || "").trim();
   if (!raw) return "/(tabs)/analyze";
@@ -44,7 +46,6 @@ function normalizeRoute(v: string) {
 function parseParams(url: string) {
   const out: Record<string, string> = {};
 
-  // query (?a=b&c=d)
   const qIndex = url.indexOf("?");
   if (qIndex !== -1) {
     const q = url.slice(qIndex + 1).split("#")[0];
@@ -57,7 +58,6 @@ function parseParams(url: string) {
       });
   }
 
-  // hash (#a=b&c=d) — some providers return tokens here
   const hIndex = url.indexOf("#");
   if (hIndex !== -1) {
     const h = url.slice(hIndex + 1);
@@ -88,13 +88,26 @@ async function withTimeout<T>(p: Promise<T>, ms = 12000, label = "Request") {
 
 /**
  * Nonce generator
- * - We will send SHA256(nonce) to Apple
- * - We will send the raw nonce to Supabase
+ * - Send SHA256(nonce) to Apple
+ * - Send raw nonce to Supabase
  */
 function makeNonce() {
   return `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random()
     .toString(36)
     .slice(2)}`;
+}
+
+function isAppleCancel(err: any) {
+  // expo-apple-authentication typically throws an error with `code`
+  // Possible values: "ERR_REQUEST_CANCELED" or "ERR_CANCELED" depending on runtime.
+  const code = err?.code ?? err?.error ?? "";
+  const msg = String(err?.message ?? "");
+  return (
+    code === "ERR_REQUEST_CANCELED" ||
+    code === "ERR_CANCELED" ||
+    msg.toLowerCase().includes("canceled") ||
+    msg.toLowerCase().includes("cancelled")
+  );
 }
 
 export default function SaveProgress() {
@@ -107,16 +120,14 @@ export default function SaveProgress() {
   );
 
   const userId = useAuthStore((s) => s.userId);
-  const setDidPromptSaveProgress = useAuthStore(
-    (s) => s.setDidPromptSaveProgress
-  );
+  const setDidPromptSaveProgress = useAuthStore((s) => s.setDidPromptSaveProgress);
   const ensureGuestSession = useAuthStore((s) => s.ensureGuestSession);
   const bootstrapAuth = useAuthStore((s) => s.bootstrapAuth);
 
-  const [busy, setBusy] = useState<null | "apple" | "google" | "finishing">(null);
+  const [busy, setBusy] = useState<BusyState>(null);
   const finalizedRef = useRef(false);
 
-  // We deep-link back to THIS screen for OAuth (Google).
+  // Deep-link back to THIS screen for OAuth (Google).
   const redirectTo = useMemo(() => {
     return Linking.createURL("/saveprogress", {
       queryParams: { next: nextRoute },
@@ -134,7 +145,7 @@ export default function SaveProgress() {
         }
         await ensureGuestSession();
       } catch (e: any) {
-        console.log("🟨 [saveprogress] session ensure failed:", e?.message ?? e);
+        console.log("🟨 [saveprogress] ensure session failed:", e?.message ?? e);
       }
     })();
   }, [ensureGuestSession, bootstrapAuth]);
@@ -143,13 +154,17 @@ export default function SaveProgress() {
     if (finalizedRef.current) return;
     finalizedRef.current = true;
 
-    setDidPromptSaveProgress(true);
-
-    // IMPORTANT: clear loading state so UI doesn’t “stick”
-    setBusy(null);
-
-    router.replace(nextRoute as any);
-  }, [router, nextRoute, setDidPromptSaveProgress]);
+    try {
+      setDidPromptSaveProgress(true);
+      // Refresh store state after a successful auth
+      await bootstrapAuth();
+    } catch (e: any) {
+      console.log("🟨 [saveprogress] bootstrapAuth failed:", e?.message ?? e);
+    } finally {
+      setBusy(null);
+      router.replace(nextRoute as any);
+    }
+  }, [router, nextRoute, setDidPromptSaveProgress, bootstrapAuth]);
 
   const completeFromUrl = useCallback(
     async (url: string) => {
@@ -196,7 +211,10 @@ export default function SaveProgress() {
           );
 
           if ((res as any)?.error) {
-            console.log("❌ [saveprogress] setSession error:", (res as any).error.message);
+            console.log(
+              "❌ [saveprogress] setSession error:",
+              (res as any).error.message
+            );
             setBusy(null);
             Alert.alert("Sign-in failed", "Couldn’t complete sign-in. Please try again.");
             return;
@@ -217,10 +235,8 @@ export default function SaveProgress() {
   // Warm app deep link handling (Google OAuth completion)
   useEffect(() => {
     const sub = Linking.addEventListener("url", async ({ url }) => {
-      console.log("🔁 [saveprogress] url event:", url);
       await completeFromUrl(url);
     });
-
     return () => sub.remove();
   }, [completeFromUrl]);
 
@@ -230,7 +246,6 @@ export default function SaveProgress() {
       try {
         const initial = await Linking.getInitialURL();
         if (initial) {
-          console.log("🧊 [saveprogress] initial url:", initial);
           await completeFromUrl(initial);
         }
       } catch {}
@@ -240,8 +255,8 @@ export default function SaveProgress() {
   /**
    * ✅ Native Apple Sign-In (NO browser)
    * IMPORTANT:
-   * - Apple should receive SHA256(nonce)
-   * - Supabase should receive raw nonce
+   * - Apple receives SHA256(nonce)
+   * - Supabase receives raw nonce
    */
   const startAppleNative = useCallback(async () => {
     if (busy) return;
@@ -274,7 +289,7 @@ export default function SaveProgress() {
           AppleAuthentication.AppleAuthenticationScope.FULL_NAME,
           AppleAuthentication.AppleAuthenticationScope.EMAIL,
         ],
-        nonce: hashedNonce, // ✅ hashed sent to Apple
+        nonce: hashedNonce,
       });
 
       const idToken = credential?.identityToken;
@@ -282,12 +297,11 @@ export default function SaveProgress() {
         throw new Error("Apple Sign-In failed (missing identity token).");
       }
 
-      // Create Supabase session without browser OAuth
       const res = await withTimeout(
         supabase.auth.signInWithIdToken({
           provider: "apple",
           token: idToken,
-          nonce: rawNonce, // ✅ raw nonce sent to Supabase
+          nonce: rawNonce,
         }),
         12000,
         "signInWithIdToken"
@@ -299,24 +313,19 @@ export default function SaveProgress() {
 
       await finalizeAndContinue();
     } catch (e: any) {
-      const msg = e?.message ?? String(e);
-
-      // User canceled
-      if (msg.includes("ERR_REQUEST_CANCELED")) {
+      if (isAppleCancel(e)) {
         setBusy(null);
         return;
       }
 
-      console.log("❌ [saveprogress] apple native error:", msg);
+      console.log("❌ [saveprogress] apple native error:", e?.message ?? e);
       setBusy(null);
-      Alert.alert("Couldn’t sign in", msg || "Please try again.");
+      Alert.alert("Couldn’t sign in", e?.message ?? "Please try again.");
     }
   }, [busy, userId, ensureGuestSession, finalizeAndContinue]);
 
   /**
-   * Google OAuth can remain web-based.
-   * If you still get “cannot connect”, it’s a redirect/deeplink config issue,
-   * and we’ll fix that next (scheme + Supabase redirect URLs).
+   * Google OAuth remains web-based (browser) and returns via deep link to this route.
    */
   const startGoogleOAuth = useCallback(async () => {
     if (busy) return;
@@ -331,9 +340,7 @@ export default function SaveProgress() {
       const { data, error } = await withTimeout(
         supabase.auth.signInWithOAuth({
           provider: "google",
-          options: {
-            redirectTo,
-          },
+          options: { redirectTo },
         }),
         12000,
         "signInWithOAuth"
@@ -354,7 +361,7 @@ export default function SaveProgress() {
     }
   }, [busy, userId, ensureGuestSession, redirectTo]);
 
-  const skip = useCallback(async () => {
+  const skip = useCallback(() => {
     setDidPromptSaveProgress(true);
     router.replace(nextRoute as any);
   }, [router, nextRoute, setDidPromptSaveProgress]);
@@ -521,7 +528,11 @@ const styles = StyleSheet.create({
     marginLeft: 10,
   },
 
-  btnRow: { flexDirection: "row", alignItems: "center", justifyContent: "center" },
+  btnRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+  },
 
   skipBtn: { marginTop: 18, paddingVertical: 10, paddingHorizontal: 14 },
   skipText: { color: C.dim2, fontWeight: "900", fontSize: 14 },
