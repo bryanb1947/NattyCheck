@@ -48,9 +48,6 @@ function clampIndex(v: number) {
   return Math.min(Math.max(v, 0), 2);
 }
 
-/* -------------------------------------------------------------
-   COMPONENT
-------------------------------------------------------------- */
 export default function CaptureScreen() {
   const insets = useSafeAreaInsets();
   const cameraRef = useRef<CameraView | null>(null);
@@ -130,32 +127,13 @@ export default function CaptureScreen() {
   }, [photoIndex, anyBusy, router]);
 
   /* -------------------------------------------------------------
-     COUNTDOWN → CAPTURE
+     COUNTDOWN HELPERS
   ------------------------------------------------------------- */
   const clearCountdown = useCallback(() => {
     if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
     countdownTimerRef.current = null;
     setCountdown(0);
   }, []);
-
-  const startCountdown = useCallback(() => {
-    if (anyBusy) return;
-
-    clearCountdown();
-
-    let sec = 3;
-    setCountdown(sec);
-
-    countdownTimerRef.current = setInterval(() => {
-      sec -= 1;
-      setCountdown(sec);
-
-      if (sec <= 0) {
-        clearCountdown();
-        void capturePhoto();
-      }
-    }, 1000);
-  }, [anyBusy, clearCountdown]);
 
   /* -------------------------------------------------------------
      CAPTURE LOGIC
@@ -179,7 +157,10 @@ export default function CaptureScreen() {
           await ensureGuestSession();
         }
       } catch (e) {
-        console.log("🟨 ensure session failed (non-fatal):", (e as any)?.message ?? e);
+        console.log(
+          "🟨 ensure session failed (non-fatal):",
+          (e as any)?.message ?? e
+        );
       }
 
       const photo = await cameraRef.current.takePictureAsync({
@@ -222,7 +203,7 @@ export default function CaptureScreen() {
           base64: photo.base64,
           ext: "jpg",
           kind: "original",
-        });
+        } as any);
       } catch (uploadErr) {
         console.log("❌ Photo upload failed:", uploadErr);
         // keep flow smooth; local file is enough to continue
@@ -240,6 +221,7 @@ export default function CaptureScreen() {
 
       setIsCapturing(false);
 
+      // ✅ Use CURRENT photoIndex so preview matches angle
       router.push({
         pathname: "/preview",
         params: { index: String(photoIndex) },
@@ -260,6 +242,29 @@ export default function CaptureScreen() {
     resetAngle,
     setAngle,
   ]);
+
+  /* -------------------------------------------------------------
+     COUNTDOWN → CAPTURE
+     ✅ IMPORTANT: depends on capturePhoto to avoid stale closure
+  ------------------------------------------------------------- */
+  const startCountdown = useCallback(() => {
+    if (anyBusy) return;
+
+    clearCountdown();
+
+    let sec = 3;
+    setCountdown(sec);
+
+    countdownTimerRef.current = setInterval(() => {
+      sec -= 1;
+      setCountdown(sec);
+
+      if (sec <= 0) {
+        clearCountdown();
+        void capturePhoto();
+      }
+    }, 1000);
+  }, [anyBusy, clearCountdown, capturePhoto]);
 
   /* -------------------------------------------------------------
      PERMISSION UI
@@ -286,7 +291,6 @@ export default function CaptureScreen() {
   ------------------------------------------------------------- */
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
-      {/* Back arrow ONLY on first angle */}
       {photoIndex === 0 && (
         <View style={styles.topBar}>
           <TouchableOpacity
@@ -304,7 +308,6 @@ export default function CaptureScreen() {
         </View>
       )}
 
-      {/* CAMERA */}
       <View style={styles.cameraFrame}>
         <CameraView ref={cameraRef} style={styles.camera} facing={facing} />
 
@@ -321,7 +324,6 @@ export default function CaptureScreen() {
 
       {countdown > 0 && <Text style={styles.countdown}>{countdown}</Text>}
 
-      {/* CONTROLS */}
       <View style={styles.controls}>
         <TouchableOpacity
           style={styles.flipButton}
@@ -357,21 +359,10 @@ export default function CaptureScreen() {
   );
 }
 
-/* -------------------------------------------------------------
-   STYLES
-------------------------------------------------------------- */
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: "#000",
-    alignItems: "center",
-  },
+  container: { flex: 1, backgroundColor: "#000", alignItems: "center" },
 
-  topBar: {
-    width: "100%",
-    paddingHorizontal: 12,
-    marginBottom: 8,
-  },
+  topBar: { width: "100%", paddingHorizontal: 12, marginBottom: 8 },
 
   backIconWrapper: {
     width: 46,
@@ -407,12 +398,7 @@ const styles = StyleSheet.create({
     borderWidth: 3,
   },
 
-  angleText: {
-    marginTop: 16,
-    color: "#B8FF48",
-    fontSize: 20,
-    fontWeight: "800",
-  },
+  angleText: { marginTop: 16, color: "#B8FF48", fontSize: 20, fontWeight: "800" },
 
   instruction: {
     color: "#fff",
@@ -430,15 +416,9 @@ const styles = StyleSheet.create({
     top: height * 0.42,
   },
 
-  controls: {
-    flexDirection: "row",
-    alignItems: "center",
-    marginTop: 32,
-  },
+  controls: { flexDirection: "row", alignItems: "center", marginTop: 32 },
 
-  flipButton: {
-    marginRight: 40,
-  },
+  flipButton: { marginRight: 40 },
 
   captureButton: {
     width: 82,
@@ -450,24 +430,11 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
 
-  innerCircle: {
-    width: 60,
-    height: 60,
-    borderRadius: 30,
-    backgroundColor: "#00FFE0",
-  },
+  innerCircle: { width: 60, height: 60, borderRadius: 30, backgroundColor: "#00FFE0" },
 
-  uploadingText: {
-    marginTop: 14,
-    color: "rgba(255,255,255,0.75)",
-    fontSize: 12,
-  },
+  uploadingText: { marginTop: 14, color: "rgba(255,255,255,0.75)", fontSize: 12 },
 
-  bottomHint: {
-    marginTop: 10,
-    color: "rgba(255,255,255,0.35)",
-    fontSize: 11,
-  },
+  bottomHint: { marginTop: 10, color: "rgba(255,255,255,0.35)", fontSize: 11 },
 
   permissionContainer: {
     flex: 1,
@@ -485,9 +452,5 @@ const styles = StyleSheet.create({
     borderRadius: 12,
   },
 
-  permissionButtonText: {
-    fontSize: 16,
-    color: "#000",
-    fontWeight: "800",
-  },
+  permissionButtonText: { fontSize: 16, color: "#000", fontWeight: "800" },
 });
