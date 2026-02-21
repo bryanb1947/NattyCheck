@@ -1,5 +1,5 @@
 // app/capture.tsx
-import React, { useRef, useState, useEffect } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   View,
   Text,
@@ -7,21 +7,22 @@ import {
   StyleSheet,
   Dimensions,
   ActivityIndicator,
+  Alert,
+  Platform,
 } from "react-native";
 
 import { CameraView, useCameraPermissions } from "expo-camera";
 import { Ionicons } from "@expo/vector-icons";
-import {
-  useRouter,
-  useLocalSearchParams,
-  useNavigation,
-} from "expo-router";
-
-import { useCaptureStore } from "@/store/useCaptureStore";
+import { useLocalSearchParams, useNavigation, useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-// ⭐ USE LEGACY API — fixes all crashes & warnings
+// ⭐ USE LEGACY API — fixes iOS crashes & warnings
 import * as FileSystem from "expo-file-system/legacy";
+
+import { useCaptureStore } from "@/store/useCaptureStore";
+import { useAuthStore } from "@/store/useAuthStore";
+import { supabase } from "@/lib/supabase";
+import { uploadUserPhotoBase64 } from "@/lib/photos";
 
 const { width, height } = Dimensions.get("window");
 const ANGLES: Array<"front" | "side" | "back"> = ["front", "side", "back"];
@@ -30,7 +31,8 @@ const ANGLES: Array<"front" | "side" | "back"> = ["front", "side", "back"];
    LIGHTWEIGHT VALIDATION
 ------------------------------------------------------------- */
 function validateFinalPhoto(photo: any) {
-  const { width: w, height: h } = photo;
+  const w = photo?.width;
+  const h = photo?.height;
 
   if (!w || !h) return "Image corrupted — retake photo.";
   if (h < 600 || w < 300) return "Step back slightly — more body needed.";
@@ -39,6 +41,11 @@ function validateFinalPhoto(photo: any) {
   if (ratio < 1.15) return "Hold your phone vertically for a full-body shot.";
 
   return null;
+}
+
+function clampIndex(v: number) {
+  if (!Number.isFinite(v)) return 0;
+  return Math.min(Math.max(v, 0), 2);
 }
 
 /* -------------------------------------------------------------
@@ -50,143 +57,209 @@ export default function CaptureScreen() {
 
   const router = useRouter();
   const navigation = useNavigation();
-  const params = useLocalSearchParams();
+  const params = useLocalSearchParams<{ photoIndex?: string; index?: string }>();
 
   const [permission, requestPermission] = useCameraPermissions();
   const [facing, setFacing] = useState<"front" | "back">("front");
 
   const [isCapturing, setIsCapturing] = useState(false);
-  const [countdown, setCountdown] = useState(0);
-  const [photoIndex, setPhotoIndex] = useState(0);
+  const [isUploading, setIsUploading] = useState(false);
 
-  const { set } = useCaptureStore();
+  const [countdown, setCountdown] = useState(0);
+  const countdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const [photoIndex, setPhotoIndex] = useState(0);
 
   const [outlineColor, setOutlineColor] = useState("#FF5C7A");
   const [bodyHint, setBodyHint] = useState("Step fully into the outline.");
+
+  const currentAngle = useMemo(() => ANGLES[photoIndex], [photoIndex]);
+
+  // store helpers (works with your updated store + older versions)
+  const setAngle =
+    (useCaptureStore as any)((s: any) => s.setAngle) ??
+    useCaptureStore((s) => s.set as any);
+
+  const resetAngle =
+    (useCaptureStore as any)((s: any) => s.resetAngle) ?? null;
+
+  const ensureGuestSession = useAuthStore((s) => s.ensureGuestSession);
+
+  const anyBusy = isCapturing || isUploading;
 
   /* -------------------------------------------------------------
      INITIAL SETUP
   ------------------------------------------------------------- */
   useEffect(() => {
     requestPermission();
-    if (params?.photoIndex) {
-      const idx = parseInt(params.photoIndex as string, 10);
-      if (!isNaN(idx)) setPhotoIndex(idx);
+
+    const p = params?.photoIndex ?? params?.index;
+    if (p != null) {
+      const idx = clampIndex(parseInt(String(p), 10));
+      setPhotoIndex(idx);
     }
+
+    return () => {
+      if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
+      countdownTimerRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // slight delay reduces iOS camera flicker
   useEffect(() => {
-    if (permission?.granted) {
-      // slight delay fixes iOS flicker
-      setTimeout(() => setFacing("front"), 60);
-    }
+    if (!permission?.granted) return;
+    const t = setTimeout(() => setFacing("front"), 60);
+    return () => clearTimeout(t);
   }, [permission?.granted]);
-
-  const currentAngle = ANGLES[photoIndex];
 
   /* -------------------------------------------------------------
      ENABLE NATIVE iOS SWIPE BACK
   ------------------------------------------------------------- */
   useEffect(() => {
     navigation.setOptions?.({
-      gestureEnabled: photoIndex === 0,
+      gestureEnabled: photoIndex === 0 && !anyBusy,
     });
-  }, [navigation, photoIndex]);
+  }, [navigation, photoIndex, anyBusy]);
 
   /* -------------------------------------------------------------
      BACK OUT
   ------------------------------------------------------------- */
-  const handleBackOut = () => {
-    if (photoIndex === 0) router.back();
-  };
+  const handleBackOut = useCallback(() => {
+    if (photoIndex === 0 && !anyBusy) router.back();
+  }, [photoIndex, anyBusy, router]);
 
   /* -------------------------------------------------------------
      COUNTDOWN → CAPTURE
   ------------------------------------------------------------- */
-  const startCountdown = () => {
-    if (isCapturing) return;
+  const clearCountdown = useCallback(() => {
+    if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
+    countdownTimerRef.current = null;
+    setCountdown(0);
+  }, []);
+
+  const startCountdown = useCallback(() => {
+    if (anyBusy) return;
+
+    clearCountdown();
 
     let sec = 3;
     setCountdown(sec);
 
-    const timer = setInterval(() => {
-      sec--;
+    countdownTimerRef.current = setInterval(() => {
+      sec -= 1;
       setCountdown(sec);
 
       if (sec <= 0) {
-        clearInterval(timer);
-        setCountdown(0);
-        capturePhoto();
+        clearCountdown();
+        void capturePhoto();
       }
     }, 1000);
-  };
+  }, [anyBusy, clearCountdown]);
 
   /* -------------------------------------------------------------
      CAPTURE LOGIC
   ------------------------------------------------------------- */
-  const capturePhoto = async () => {
+  const capturePhoto = useCallback(async () => {
     if (!cameraRef.current) return;
+    if (anyBusy) return;
 
     try {
       setIsCapturing(true);
+      setOutlineColor("#FF5C7A");
+      setBodyHint("Hold still…");
+
+      // If user is retaking, wipe old refs for this angle
+      if (resetAngle) resetAngle(currentAngle);
+
+      // best-effort: ensure anon session BEFORE upload
+      try {
+        const { data } = await supabase.auth.getSession();
+        if (!data?.session?.user?.id) {
+          await ensureGuestSession();
+        }
+      } catch (e) {
+        console.log("🟨 ensure session failed (non-fatal):", (e as any)?.message ?? e);
+      }
 
       const photo = await cameraRef.current.takePictureAsync({
         quality: 0.85,
         base64: true,
         skipProcessing: false,
-        // @ts-ignore — expo-camera internal flag
+        // @ts-ignore — expo-camera internal flag (some builds)
         convertResponseToBase64: true,
       });
 
       const err = validateFinalPhoto(photo);
       if (err) {
-        setOutlineColor("#FF5C7A");
         setBodyHint(err);
         setIsCapturing(false);
         return;
       }
 
-      if (!photo.base64) {
-        setOutlineColor("#FF5C7A");
+      if (!photo?.base64) {
         setBodyHint("Photo data missing — retake.");
         setIsCapturing(false);
         return;
       }
 
-      /* -------------------------------------------------------------
-         SAVE LOCAL PHOTO (NO UPLOADS)
-      ------------------------------------------------------------- */
+      // SAVE LOCAL (always)
       const filePath =
-        FileSystem.documentDirectory +
-        `${currentAngle}_${Date.now()}.jpg`;
+        FileSystem.documentDirectory + `${currentAngle}_${Date.now()}.jpg`;
 
       await FileSystem.writeAsStringAsync(filePath, photo.base64, {
-        encoding: "base64", // ⭐ stable everywhere
+        encoding: "base64",
       });
 
-      // Save uri + base64 (for API)
-      set(currentAngle, {
+      // UPLOAD (best-effort)
+      setIsUploading(true);
+      setBodyHint("Saving…");
+
+      let uploaded: { id: string; storage_path: string } | null = null;
+
+      try {
+        uploaded = await uploadUserPhotoBase64({
+          base64: photo.base64,
+          ext: "jpg",
+          kind: "original",
+        });
+      } catch (uploadErr) {
+        console.log("❌ Photo upload failed:", uploadErr);
+        // keep flow smooth; local file is enough to continue
+      } finally {
+        setIsUploading(false);
+      }
+
+      // STORE IN ZUSTAND
+      setAngle(currentAngle, {
         uri: filePath,
         base64: photo.base64,
+        photoId: uploaded?.id,
+        storagePath: uploaded?.storage_path,
       });
-
-      /* -------------------------------------------------------------
-         END SAVE
-      ------------------------------------------------------------- */
 
       setIsCapturing(false);
 
       router.push({
         pathname: "/preview",
-        params: { index: photoIndex },
+        params: { index: String(photoIndex) },
       });
-    } catch (e) {
-      console.log("CAPTURE ERROR", e);
-      setOutlineColor("#FF5C7A");
+    } catch (e: any) {
+      console.log("CAPTURE ERROR:", e?.message ?? e);
       setBodyHint("Capture failed — retry.");
+      setIsUploading(false);
       setIsCapturing(false);
+      Alert.alert("Capture failed", "Please try again.");
     }
-  };
+  }, [
+    anyBusy,
+    currentAngle,
+    photoIndex,
+    router,
+    ensureGuestSession,
+    resetAngle,
+    setAngle,
+  ]);
 
   /* -------------------------------------------------------------
      PERMISSION UI
@@ -220,8 +293,13 @@ export default function CaptureScreen() {
             onPress={handleBackOut}
             style={styles.backIconWrapper}
             hitSlop={{ top: 14, bottom: 14, left: 14, right: 14 }}
+            disabled={anyBusy}
           >
-            <Ionicons name="chevron-back" size={32} color="#fff" />
+            <Ionicons
+              name="chevron-back"
+              size={32}
+              color={anyBusy ? "rgba(255,255,255,0.35)" : "#fff"}
+            />
           </TouchableOpacity>
         </View>
       )}
@@ -231,12 +309,7 @@ export default function CaptureScreen() {
         <CameraView ref={cameraRef} style={styles.camera} facing={facing} />
 
         <View style={styles.overlay}>
-          <View
-            style={[
-              styles.ovalOutline,
-              { borderColor: outlineColor },
-            ]}
-          />
+          <View style={[styles.ovalOutline, { borderColor: outlineColor }]} />
         </View>
       </View>
 
@@ -253,22 +326,33 @@ export default function CaptureScreen() {
         <TouchableOpacity
           style={styles.flipButton}
           onPress={() => setFacing(facing === "front" ? "back" : "front")}
+          disabled={anyBusy}
         >
           <Ionicons name="camera-reverse-outline" size={32} color="#fff" />
         </TouchableOpacity>
 
         <TouchableOpacity
           style={styles.captureButton}
-          disabled={isCapturing}
+          disabled={anyBusy}
           onPress={startCountdown}
         >
-          {isCapturing ? (
+          {anyBusy ? (
             <ActivityIndicator size="small" color="#00FFE0" />
           ) : (
             <View style={styles.innerCircle} />
           )}
         </TouchableOpacity>
       </View>
+
+      {isUploading && (
+        <Text style={styles.uploadingText}>Backing up photo…</Text>
+      )}
+
+      {Platform.OS === "ios" && (
+        <Text style={styles.bottomHint}>
+          Tip: keep your full body in frame (head to feet).
+        </Text>
+      )}
     </View>
   );
 }
@@ -371,6 +455,18 @@ const styles = StyleSheet.create({
     height: 60,
     borderRadius: 30,
     backgroundColor: "#00FFE0",
+  },
+
+  uploadingText: {
+    marginTop: 14,
+    color: "rgba(255,255,255,0.75)",
+    fontSize: 12,
+  },
+
+  bottomHint: {
+    marginTop: 10,
+    color: "rgba(255,255,255,0.35)",
+    fontSize: 11,
   },
 
   permissionContainer: {

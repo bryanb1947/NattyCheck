@@ -1,5 +1,5 @@
 // app/paywall.tsx
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   View,
   Text,
@@ -9,12 +9,18 @@ import {
   ScrollView,
   ActivityIndicator,
   Alert,
+  Platform,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { LinearGradient } from "expo-linear-gradient";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter, useLocalSearchParams } from "expo-router";
-import Purchases, { Offerings, CustomerInfo, PurchasesPackage } from "react-native-purchases";
+import Purchases, {
+  Offerings,
+  CustomerInfo,
+  PurchasesPackage,
+  PurchasesError,
+} from "react-native-purchases";
 
 import { supabase } from "@/lib/supabase";
 import { initRevenueCat, syncEntitlementsToSupabase } from "@/lib/revenuecat";
@@ -32,41 +38,9 @@ type PlanOption = {
   subtext: string;
   badge?: string;
   pkg: PurchasesPackage | null;
+  // optional free trial copy, pulled from StoreKit where possible
+  trialText?: string;
 };
-
-/* -------------------------------------------------------
-   PACKAGE PICKER
-------------------------------------------------------- */
-function pickPackage(
-  pkgs: PurchasesPackage[],
-  opts: { annual?: boolean; monthly?: boolean }
-): PurchasesPackage | null {
-  if (!pkgs?.length) return null;
-
-  const byType = (t: string) => pkgs.find((p) => String(p.packageType) === t) ?? null;
-
-  const byRegex = (re: RegExp) =>
-    pkgs.find((p) => re.test(p.identifier)) ??
-    pkgs.find((p) => re.test(p.product.identifier)) ??
-    null;
-
-  if (opts.annual) {
-    const monthly = byType("MONTHLY") ?? byRegex(/month|mo/i);
-    return (
-      byType("ANNUAL") ||
-      byRegex(/annual|year|yr/i) ||
-      pkgs.find((p) => p !== monthly) ||
-      pkgs[0] ||
-      null
-    );
-  }
-
-  if (opts.monthly) {
-    return byType("MONTHLY") || byRegex(/month|mo/i) || pkgs[0] || null;
-  }
-
-  return pkgs[0] ?? null;
-}
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -74,42 +48,128 @@ function hasProEntitlement(customerInfo: CustomerInfo): boolean {
   return !!customerInfo?.entitlements?.active?.["pro"];
 }
 
+function normalizeOfferingsError(e: any): string {
+  const raw = String(e?.message ?? e ?? "").trim();
+
+  if (!raw) return "Failed to load plans.";
+
+  // common SDK message if Purchases.configure wasn't called
+  if (raw.includes("There is no singleton instance")) return "RevenueCat is not configured.";
+
+  return raw;
+}
+
+/**
+ * Best-effort: determine annual/monthly packages.
+ * Prefers packageType, then falls back to identifier regexes.
+ */
+function pickAnnualAndMonthly(pkgs: PurchasesPackage[]) {
+  const byType = (t: string) => pkgs.find((p) => String(p.packageType) === t) ?? null;
+
+  const byRegex = (re: RegExp) =>
+    pkgs.find((p) => re.test(p.identifier)) ??
+    pkgs.find((p) => re.test(p.product.identifier)) ??
+    null;
+
+  const monthly =
+    byType("MONTHLY") ||
+    byRegex(/month|monthly|\bmo\b/i) ||
+    pkgs[0] ||
+    null;
+
+  const annual =
+    byType("ANNUAL") ||
+    byRegex(/annual|year|yearly|\byr\b/i) ||
+    pkgs.find((p) => p !== monthly) ||
+    pkgs[0] ||
+    null;
+
+  return { annual, monthly };
+}
+
+/**
+ * iOS only: display introductory/free trial messaging if present.
+ * The SDK exposes intro info on iOS; on Android it may differ.
+ */
+function getTrialText(pkg: PurchasesPackage | null): string | undefined {
+  if (!pkg) return undefined;
+  const p: any = pkg.product as any;
+
+  // RevenueCat iOS: product.introPrice / introductoryPrice can exist depending on versions.
+  // We keep it defensive to avoid crashes.
+  const intro = p?.introPrice ?? p?.introductoryPrice ?? null;
+  const introPeriod = intro?.period ?? intro?.subscriptionPeriod ?? null;
+
+  // Some versions provide `introPricePeriod` or `introPrice` already formatted
+  const introDuration = introPeriod?.value ?? introPeriod?.numberOfUnits ?? null;
+  const introUnit = introPeriod?.unit ?? introPeriod?.unitType ?? null;
+
+  // If you specifically set "3-day free trial", this usually appears as price = 0 for 3 days.
+  // We'll try to show something like "3-day free trial" when we can infer.
+  const price = intro?.priceString ?? intro?.price ?? null;
+
+  const isFree =
+    price === 0 ||
+    price === "0" ||
+    String(price ?? "").includes("0.00") ||
+    String(intro?.priceString ?? "").includes("0");
+
+  if (introDuration && introUnit) {
+    const unit =
+      String(introUnit).toLowerCase().includes("day") || introUnit === "DAY" ? "day" :
+      String(introUnit).toLowerCase().includes("week") || introUnit === "WEEK" ? "week" :
+      String(introUnit).toLowerCase().includes("month") || introUnit === "MONTH" ? "month" :
+      String(introUnit).toLowerCase().includes("year") || introUnit === "YEAR" ? "year" :
+      "day";
+
+    const plural = Number(introDuration) === 1 ? "" : "s";
+    if (isFree) return `${introDuration}-${unit}${plural} free trial`;
+    return `${introDuration}-${unit}${plural} intro offer`;
+  }
+
+  // Fallback to common expectation
+  return undefined;
+}
+
 export default function PaywallScreen() {
   const router = useRouter();
   const params = useLocalSearchParams<{ link?: string; next?: string }>();
 
-  // ✅ readiness signal
+  // readiness signal from app bootstrap
   const hasBootstrappedSession = useAuthStore((s) => s.hasBootstrappedSession);
 
-  // store identity
+  // auth store fields
   const storedUserId = useAuthStore((s) => s.userId);
   const setPlan = useAuthStore((s) => s.setPlan);
   const setIdentity = useAuthStore((s) => s.setIdentity);
 
   const [selected, setSelected] = useState<PlanId>("annual");
+
   const [offerings, setOfferings] = useState<Offerings | null>(null);
   const [loadingOfferings, setLoadingOfferings] = useState(true);
   const [offeringsError, setOfferingsError] = useState<string | null>(null);
-  const [purchasing, setPurchasing] = useState(false);
 
+  const [purchasing, setPurchasing] = useState(false);
   const [finishingUnlock, setFinishingUnlock] = useState(false);
   const [unlockHint, setUnlockHint] = useState<string | null>(null);
 
-  /* -------------------------------------------------------
-     Ensure we have a usable Supabase session (anon ok)
-  ------------------------------------------------------- */
+  const didAutoLoad = useRef(false);
+
+  /**
+   * Ensure we have a usable Supabase session (anon ok).
+   */
   const ensureSessionReady = useCallback(async () => {
-    // 1) existing session?
+    // existing session?
     try {
       const { data } = await supabase.auth.getSession();
       const sess = data?.session ?? null;
       if (sess?.user?.id) return { uid: sess.user.id, email: sess.user.email ?? null };
     } catch {}
 
-    // 2) fallback: store id
+    // fallback: store userId
     if (storedUserId) return { uid: storedUserId, email: null };
 
-    // 3) last resort: create anon
+    // last resort: sign in anonymously
     try {
       const { data, error } = await supabase.auth.signInAnonymously();
       if (error) throw error;
@@ -122,17 +182,19 @@ export default function PaywallScreen() {
     return { uid: null as string | null, email: null as string | null };
   }, [storedUserId]);
 
-  /* -------------------------------------------------------
-     Resolve best identity for RC + store
-  ------------------------------------------------------- */
+  /**
+   * Resolve best identity for RC + store.
+   */
   const getEffectiveIdentity = useCallback(async () => {
     const ensured = await ensureSessionReady();
-    if (!ensured.uid)
+    if (!ensured.uid) {
       return { uid: null as string | null, email: null as string | null, isAuthed: false };
+    }
 
     try {
       const { data } = await supabase.auth.getSession();
       const sess = data?.session ?? null;
+
       const uid = sess?.user?.id ?? ensured.uid;
       const email = sess?.user?.email ?? ensured.email ?? null;
 
@@ -144,11 +206,11 @@ export default function PaywallScreen() {
     }
   }, [ensureSessionReady, setIdentity]);
 
-  /* -------------------------------------------------------
-     Confirm Pro in Supabase profiles (prevents paywall loops)
-  ------------------------------------------------------- */
+  /**
+   * Confirm Pro in Supabase profiles (prevents paywall loop).
+   */
   const confirmProInProfile = useCallback(async (uid: string) => {
-    const attempts = 8; // ~4s
+    const attempts = 10; // ~5s
     for (let i = 0; i < attempts; i++) {
       const { data, error } = await supabase
         .from("profiles")
@@ -170,9 +232,34 @@ export default function PaywallScreen() {
     return { ok: false as const, reason: "Profile not updated yet." };
   }, []);
 
-  /* -------------------------------------------------------
-     Load offerings
-  ------------------------------------------------------- */
+  /**
+   * Route AFTER unlock.
+   * - Always route to next (defaults to /premiumresults).
+   * - Optionally prompt linking if link=1 and they are anon.
+   */
+  const routeAfterUnlock = useCallback(
+    async (ident: { uid: string; email: string | null }) => {
+      const next =
+        typeof params.next === "string" && params.next.length
+          ? params.next
+          : "/premiumresults";
+
+      const wantsLink = String(params.link ?? "") === "1";
+      const isAnon = !ident.email;
+
+      if (wantsLink && isAnon) {
+        router.replace({ pathname: "/linkaccount", params: { next } } as any);
+        return;
+      }
+
+      router.replace(next as any);
+    },
+    [router, params.next, params.link]
+  );
+
+  /**
+   * Load offerings from RevenueCat.
+   */
   const loadOfferings = useCallback(async () => {
     setLoadingOfferings(true);
     setOfferingsError(null);
@@ -193,25 +280,25 @@ export default function PaywallScreen() {
       const pkgs = o?.current?.availablePackages ?? [];
       if (!o?.current || pkgs.length === 0) {
         setOfferingsError(
-          "Plans aren’t available yet.\n\n• In RevenueCat, Offering “default” must have Monthly + Annual packages.\n• Test on a real device / dev build.\n• Apple Sandbox: Settings → App Store → Sandbox Account."
+          "Plans aren’t available yet.\n\n• In RevenueCat, Offering “default” must have Monthly + Annual packages.\n• If you just changed products, wait a minute then refresh.\n• Test on a real device / dev build (TestFlight works best).\n• Apple Sandbox: Settings → App Store → Sandbox Account."
         );
       }
     } catch (e: any) {
       console.warn("[Paywall] getOfferings() failed:", e);
       setOfferings(null);
-
-      const msg = String(e?.message ?? e ?? "")
-        .replace("There is no singleton instance.", "RevenueCat is not configured.")
-        .trim();
-
-      setOfferingsError(msg || "Failed to load plans.");
+      setOfferingsError(normalizeOfferingsError(e));
     } finally {
       setLoadingOfferings(false);
     }
   }, [getEffectiveIdentity]);
 
+  /**
+   * Auto-load once app auth bootstrap is complete.
+   */
   useEffect(() => {
     if (!hasBootstrappedSession) return;
+    if (didAutoLoad.current) return;
+    didAutoLoad.current = true;
     loadOfferings();
   }, [hasBootstrappedSession, loadOfferings]);
 
@@ -223,14 +310,15 @@ export default function PaywallScreen() {
   const plans: PlanOption[] = useMemo(() => {
     const current = offerings?.current;
     const pkgs = current?.availablePackages ?? [];
-
-    const annualPkg = pickPackage(pkgs, { annual: true });
-    const monthlyPkg = pickPackage(pkgs, { monthly: true });
-
     const ready = !!current && pkgs.length > 0;
 
-    const annualPrice = ready ? annualPkg?.product.priceString ?? "—" : "—";
-    const monthlyPrice = ready ? monthlyPkg?.product.priceString ?? "—" : "—";
+    const { annual, monthly } = pickAnnualAndMonthly(pkgs);
+
+    const annualPrice = ready ? annual?.product.priceString ?? "—" : "—";
+    const monthlyPrice = ready ? monthly?.product.priceString ?? "—" : "—";
+
+    const annualTrial = Platform.OS === "ios" ? getTrialText(annual) : undefined;
+    const monthlyTrial = Platform.OS === "ios" ? getTrialText(monthly) : undefined;
 
     return [
       {
@@ -240,7 +328,8 @@ export default function PaywallScreen() {
         periodDisplay: "/year",
         subtext: ready ? "Best value • discounted vs monthly" : "Loading…",
         badge: "Most Popular",
-        pkg: ready ? annualPkg : null,
+        pkg: ready ? annual : null,
+        trialText: annualTrial,
       },
       {
         id: "monthly",
@@ -248,7 +337,8 @@ export default function PaywallScreen() {
         priceDisplay: monthlyPrice,
         periodDisplay: "/month",
         subtext: ready ? "Flexible • cancel anytime" : "Loading…",
-        pkg: ready ? monthlyPkg : null,
+        pkg: ready ? monthly : null,
+        trialText: monthlyTrial,
       },
     ];
   }, [offerings]);
@@ -258,30 +348,9 @@ export default function PaywallScreen() {
     [plans, selected]
   );
 
-  /* -------------------------------------------------------
-     Route AFTER unlock (NO EMAIL REQUIREMENT)
-     - Always route to next.
-     - Optionally suggest/link account recovery if `link=1` AND they are anon.
-  ------------------------------------------------------- */
-  const routeAfterUnlock = useCallback(
-    async (ident: { uid: string; email: string | null }) => {
-      const next =
-        typeof params.next === "string" && params.next.length ? params.next : "/premiumresults";
-
-      const wantsLink = String(params.link ?? "") === "1";
-      const isAnon = !ident.email;
-
-      // Optional: if caller asked to prompt linking and they're anon, send them to link flow first.
-      if (wantsLink && isAnon) {
-        router.replace({ pathname: "/linkaccount", params: { next } } as any);
-        return;
-      }
-
-      router.replace(next as any);
-    },
-    [router, params.next, params.link]
-  );
-
+  /**
+   * Post-purchase success handling.
+   */
   const afterUnlock = useCallback(
     async (customerInfo: CustomerInfo) => {
       if (!hasProEntitlement(customerInfo)) {
@@ -295,7 +364,7 @@ export default function PaywallScreen() {
       setUnlockHint(null);
       setFinishingUnlock(true);
 
-      // ✅ immediate UX unlock
+      // immediate UX unlock (local)
       setPlan("pro");
 
       const ident = await getEffectiveIdentity();
@@ -305,7 +374,7 @@ export default function PaywallScreen() {
         return;
       }
 
-      // ✅ Sync entitlements to Supabase using fresh customerInfo
+      // Sync entitlements to Supabase with the freshest customerInfo
       try {
         const synced = await syncEntitlementsToSupabase({
           customerInfoOverride: customerInfo,
@@ -315,7 +384,7 @@ export default function PaywallScreen() {
         console.warn("[Paywall] syncEntitlementsToSupabase crashed (continuing):", e);
       }
 
-      // ✅ confirm profile has flipped to pro (prevents paywall loop)
+      // Confirm profile updated to pro
       const confirmed = await confirmProInProfile(ident.uid);
       if (!confirmed.ok) {
         setUnlockHint(
@@ -324,15 +393,14 @@ export default function PaywallScreen() {
       }
 
       setFinishingUnlock(false);
-
       await routeAfterUnlock({ uid: ident.uid, email: ident.email ?? null });
     },
     [setPlan, getEffectiveIdentity, confirmProInProfile, routeAfterUnlock]
   );
 
-  /* -------------------------------------------------------
-     Purchase
-  ------------------------------------------------------- */
+  /**
+   * Purchase
+   */
   const handleUnlock = useCallback(async () => {
     if (purchasing) return;
 
@@ -352,20 +420,29 @@ export default function PaywallScreen() {
 
       await initRevenueCat(ident.uid);
 
-      const { customerInfo } = await Purchases.purchasePackage(selectedPlan.pkg);
-      await afterUnlock(customerInfo);
+      const res = await Purchases.purchasePackage(selectedPlan.pkg);
+      await afterUnlock(res.customerInfo);
     } catch (e: any) {
-      if (e?.userCancelled) return;
+      const cancelled = !!(e as PurchasesError)?.userCancelled;
+      if (cancelled) return;
+
       console.warn("[Paywall] Purchase failed:", e);
-      Alert.alert("Purchase failed", e?.message ?? "Please try again.");
+      Alert.alert("Purchase failed", normalizeOfferingsError(e));
     } finally {
       setPurchasing(false);
     }
-  }, [purchasing, productsReady, selectedPlan, offeringsError, getEffectiveIdentity, afterUnlock]);
+  }, [
+    purchasing,
+    productsReady,
+    selectedPlan,
+    offeringsError,
+    getEffectiveIdentity,
+    afterUnlock,
+  ]);
 
-  /* -------------------------------------------------------
-     Restore
-  ------------------------------------------------------- */
+  /**
+   * Restore
+   */
   const handleRestore = useCallback(async () => {
     if (purchasing) return;
 
@@ -384,7 +461,7 @@ export default function PaywallScreen() {
       await afterUnlock(customerInfo);
     } catch (e: any) {
       console.warn("[Paywall] Restore failed:", e);
-      Alert.alert("Restore failed", e?.message ?? "Please try again.");
+      Alert.alert("Restore failed", normalizeOfferingsError(e));
     } finally {
       setPurchasing(false);
     }
@@ -400,6 +477,10 @@ export default function PaywallScreen() {
 
   const ctaDisabled =
     purchasing || loadingOfferings || !productsReady || !selectedPlan?.pkg || finishingUnlock;
+
+  // Copy: if you want a specific “3-day free trial” line, keep it static
+  // (actual eligibility is controlled by App Store subscription intro offer).
+  const staticTrialLine = "Start with a 3-day free trial. Cancel anytime.";
 
   return (
     <SafeAreaView style={styles.safe} edges={["top", "left", "right"]}>
@@ -435,6 +516,7 @@ export default function PaywallScreen() {
           </View>
         </LinearGradient>
 
+        {/* status / error */}
         {loadingOfferings ? (
           <View style={styles.loadingRow}>
             <ActivityIndicator color="#B8FF48" />
@@ -469,6 +551,7 @@ export default function PaywallScreen() {
           </View>
         ) : null}
 
+        {/* plans */}
         <View style={styles.planWrap}>
           {plans.map((p) => {
             const active = p.id === selected;
@@ -501,6 +584,11 @@ export default function PaywallScreen() {
 
                     <Text style={styles.planSubtext}>{p.subtext}</Text>
 
+                    {/* trial line - prefer actual intro info if present, otherwise your static copy */}
+                    <Text style={styles.trialInline}>
+                      {p.trialText ? p.trialText : staticTrialLine}
+                    </Text>
+
                     <View style={styles.radioRow}>
                       <View style={[styles.radioOuter, active && styles.radioOuterActive]}>
                         {active ? <View style={styles.radioInner} /> : null}
@@ -514,6 +602,7 @@ export default function PaywallScreen() {
           })}
         </View>
 
+        {/* CTA */}
         <TouchableOpacity
           style={styles.ctaWrapper}
           activeOpacity={0.9}
@@ -536,6 +625,7 @@ export default function PaywallScreen() {
           Subscriptions auto-renew unless cancelled in your App Store settings.
         </Text>
 
+        {/* Secondary actions */}
         <View style={styles.secondaryRow}>
           <TouchableOpacity
             onPress={handleRestore}
@@ -593,7 +683,7 @@ const styles = StyleSheet.create({
 
   scrollContent: {
     alignItems: "center",
-    paddingTop: 20,
+    paddingTop: 18,
     paddingBottom: 80,
     minHeight: height * 0.92,
   },
@@ -604,7 +694,7 @@ const styles = StyleSheet.create({
     borderRadius: 39,
     justifyContent: "center",
     alignItems: "center",
-    marginBottom: 18,
+    marginBottom: 16,
   },
 
   title: { color: "#FFFFFF", fontSize: 24, fontWeight: "800", marginBottom: 6 },
@@ -613,8 +703,8 @@ const styles = StyleSheet.create({
     color: "#9B9B9B",
     fontSize: 15,
     textAlign: "center",
-    width: "84%",
-    marginBottom: 18,
+    width: "86%",
+    marginBottom: 16,
     lineHeight: 20,
   },
 
@@ -622,13 +712,13 @@ const styles = StyleSheet.create({
     width: width * 0.9,
     borderRadius: 24,
     padding: 2,
-    marginBottom: 16,
+    marginBottom: 14,
   },
 
   featureContainer: {
     backgroundColor: "#121416",
     borderRadius: 22,
-    padding: 18,
+    padding: 16,
   },
 
   featureRow: { flexDirection: "row", alignItems: "center", paddingVertical: 8 },
@@ -654,6 +744,7 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
     marginTop: 2,
   },
+
   finishingText: { color: "#A3A3A3", fontSize: 13, fontWeight: "700" },
 
   hintWrap: {
@@ -663,6 +754,7 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     padding: 12,
   },
+
   hintText: { color: "#C9D3DA", fontSize: 12, lineHeight: 16, textAlign: "center" },
 
   errorWrap: {
@@ -692,13 +784,13 @@ const styles = StyleSheet.create({
 
   refreshText: { color: "#C9D3DA", fontSize: 13, fontWeight: "700" },
 
-  planWrap: { width: width * 0.9, gap: 12, marginTop: 6, marginBottom: 18 },
+  planWrap: { width: width * 0.9, gap: 12, marginTop: 6, marginBottom: 16 },
 
   planOuter: { width: "100%" },
 
   planBorder: { width: "100%", borderRadius: 22, padding: 2 },
 
-  planCard: { backgroundColor: "#0F1215", borderRadius: 20, padding: 18 },
+  planCard: { backgroundColor: "#0F1215", borderRadius: 20, padding: 16 },
 
   planCardActive: { backgroundColor: "#0B0F12" },
 
@@ -727,6 +819,13 @@ const styles = StyleSheet.create({
   planPeriod: { color: "#A3A3A3", fontSize: 14, marginBottom: 4 },
 
   planSubtext: { color: "#A3A3A3", fontSize: 13, marginTop: 6 },
+
+  trialInline: {
+    color: "#6F7A83",
+    fontSize: 12,
+    marginTop: 8,
+    lineHeight: 16,
+  },
 
   radioRow: { flexDirection: "row", alignItems: "center", gap: 10, marginTop: 14 },
 
@@ -757,7 +856,7 @@ const styles = StyleSheet.create({
     fontSize: 12,
     marginTop: 10,
     textAlign: "center",
-    width: "84%",
+    width: "86%",
     lineHeight: 16,
   },
 

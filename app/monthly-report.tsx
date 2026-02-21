@@ -20,7 +20,6 @@ import { Stack, useRouter, useLocalSearchParams } from "expo-router";
 
 import { supabase } from "@/lib/supabase";
 import { useAuthStore } from "@/store/useAuthStore";
-import { getPhotoHistory } from "@/lib/photoHistory";
 
 const { width } = Dimensions.get("window");
 
@@ -37,6 +36,12 @@ const colors = {
 
 const gradient = [colors.accentSoft, colors.accent2];
 
+// ✅ set this to your real bucket
+const PHOTO_BUCKET = "physique-photos";
+
+// How long signed URLs should last
+const SIGNED_URL_SECONDS = 60 * 15; // 15 minutes
+
 type AnalysisRow = {
   id: string;
   user_id: string;
@@ -47,6 +52,11 @@ type AnalysisRow = {
   type: string | null;
   muscles: Record<string, number> | null;
   created_at: string;
+
+  // ✅ NEW: link to cloud photos (added columns)
+  front_photo_id?: string | null;
+  side_photo_id?: string | null;
+  back_photo_id?: string | null;
 };
 
 type PhotoSet = {
@@ -186,12 +196,6 @@ function getSessionExercises(s: WorkoutSessionRow): LoggedExerciseDb[] {
   return exs.filter(Boolean) as LoggedExerciseDb[];
 }
 
-/**
- * ✅ Improved bucket mapping:
- * - Recognizes "legs", "lower body", "quadriceps", "hamstrings", etc.
- * - Uses both muscle field AND exercise name heuristics.
- * - Designed to never miss leg work if you logged it.
- */
 function mapExerciseToBuckets(ex: LoggedExerciseDb): VolumeBucket[] {
   const muscle = normalizeText(ex.muscle);
   const name = normalizeText(ex.name);
@@ -387,6 +391,68 @@ function mapExerciseToBuckets(ex: LoggedExerciseDb): VolumeBucket[] {
 }
 
 /* ---------------------------------------------------------
+ * Storage helpers
+ * --------------------------------------------------------*/
+async function getSignedUrlForPath(path: string): Promise<string | null> {
+  try {
+    const { data, error } = await supabase.storage
+      .from(PHOTO_BUCKET)
+      .createSignedUrl(path, SIGNED_URL_SECONDS);
+
+    if (error) {
+      console.log("signed url error:", error);
+      return null;
+    }
+    return data?.signedUrl ?? null;
+  } catch (e) {
+    console.log("signed url crash:", e);
+    return null;
+  }
+}
+
+async function photoSetFromAnalysisRow(row: AnalysisRow): Promise<PhotoSet | null> {
+  const ids = [
+    row.front_photo_id,
+    row.side_photo_id,
+    row.back_photo_id,
+  ].filter(Boolean) as string[];
+
+  if (!ids.length) return null;
+
+  // Fetch photo rows → storage_path
+  const { data, error } = await supabase
+    .from("user_photos")
+    .select("id, storage_path")
+    .in("id", ids);
+
+  if (error) {
+    console.log("user_photos fetch error:", error);
+    return null;
+  }
+
+  const byId = new Map<string, { storage_path: string }>();
+  for (const p of data || []) {
+    if (p?.id && p?.storage_path) byId.set(p.id, { storage_path: p.storage_path });
+  }
+
+  const frontPath = row.front_photo_id ? byId.get(row.front_photo_id)?.storage_path : undefined;
+  const sidePath = row.side_photo_id ? byId.get(row.side_photo_id)?.storage_path : undefined;
+  const backPath = row.back_photo_id ? byId.get(row.back_photo_id)?.storage_path : undefined;
+
+  const [frontUri, sideUri, backUri] = await Promise.all([
+    frontPath ? getSignedUrlForPath(frontPath) : Promise.resolve(null),
+    sidePath ? getSignedUrlForPath(sidePath) : Promise.resolve(null),
+    backPath ? getSignedUrlForPath(backPath) : Promise.resolve(null),
+  ]);
+
+  return {
+    frontUri: frontUri ?? undefined,
+    sideUri: sideUri ?? undefined,
+    backUri: backUri ?? undefined,
+  };
+}
+
+/* ---------------------------------------------------------
  * Component
  * --------------------------------------------------------*/
 
@@ -395,8 +461,8 @@ export default function MonthlyPhysiqueReportScreen() {
   const insets = useSafeAreaInsets();
   const params = useLocalSearchParams<{ year?: string; month?: string }>();
 
-  const { userId } = useAuthStore();
-  const hasHydratedAuth = useAuthStore.persist.hasHydrated();
+  const userId = useAuthStore((s) => s.userId);
+  const hasHydratedAuth = useAuthStore((s) => s.hasHydrated);
 
   const [loading, setLoading] = useState(true);
   const [analyses, setAnalyses] = useState<AnalysisRow[]>([]);
@@ -485,10 +551,7 @@ export default function MonthlyPhysiqueReportScreen() {
         }
 
         if (workoutResPrimary.error) {
-          console.log(
-            "Monthly report workouts (timestamp) error:",
-            workoutResPrimary.error
-          );
+          console.log("Monthly report workouts (timestamp) error:", workoutResPrimary.error);
 
           const workoutResFallback = await supabase
             .from("workout_sessions")
@@ -499,15 +562,10 @@ export default function MonthlyPhysiqueReportScreen() {
             .order("date", { ascending: true });
 
           if (workoutResFallback.error) {
-            console.log(
-              "Monthly report workouts (date) error:",
-              workoutResFallback.error
-            );
+            console.log("Monthly report workouts (date) error:", workoutResFallback.error);
             setWorkouts([]);
           } else {
-            setWorkouts(
-              (workoutResFallback.data as WorkoutSessionRow[]) || []
-            );
+            setWorkouts((workoutResFallback.data as WorkoutSessionRow[]) || []);
           }
         } else {
           setWorkouts((workoutResPrimary.data as WorkoutSessionRow[]) || []);
@@ -526,7 +584,7 @@ export default function MonthlyPhysiqueReportScreen() {
   }, [userId, hasHydratedAuth, monthStart, nextMonthStart]);
 
   /* ---------------------------------------------------------
-   * Load before/after photos for first + last analysis
+   * Load before/after photos for first + last analysis (from Storage)
    * --------------------------------------------------------*/
   useEffect(() => {
     const loadPhotos = async () => {
@@ -540,21 +598,21 @@ export default function MonthlyPhysiqueReportScreen() {
       const last = analyses[analyses.length - 1];
 
       try {
-        const [firstEntry, lastEntry] = await Promise.all([
-          getPhotoHistory(first.id),
-          getPhotoHistory(last.id),
+        const [firstSet, lastSet] = await Promise.all([
+          photoSetFromAnalysisRow(first),
+          photoSetFromAnalysisRow(last),
         ]);
 
-        setFirstPhotos(firstEntry);
-        setLastPhotos(lastEntry);
+        setFirstPhotos(firstSet);
+        setLastPhotos(lastSet);
       } catch (e) {
-        console.log("Monthly report photoHistory error:", e);
+        console.log("Monthly report photo load error:", e);
         setFirstPhotos(null);
         setLastPhotos(null);
       }
     };
 
-    loadPhotos();
+    void loadPhotos();
   }, [analyses]);
 
   /* ---------------------------------------------------------
@@ -575,19 +633,9 @@ export default function MonthlyPhysiqueReportScreen() {
     }
 
     return {
-      scoreDelta: formatDeltaInt(
-        lastAnalysis.score ?? null,
-        firstAnalysis.score ?? null
-      ),
-      bodyfatDelta: formatDelta(
-        lastAnalysis.bodyfat ?? null,
-        firstAnalysis.bodyfat ?? null,
-        "%"
-      ),
-      symmetryDelta: formatDeltaInt(
-        lastAnalysis.symmetry ?? null,
-        firstAnalysis.symmetry ?? null
-      ),
+      scoreDelta: formatDeltaInt(lastAnalysis.score ?? null, firstAnalysis.score ?? null),
+      bodyfatDelta: formatDelta(lastAnalysis.bodyfat ?? null, firstAnalysis.bodyfat ?? null, "%"),
+      symmetryDelta: formatDeltaInt(lastAnalysis.symmetry ?? null, firstAnalysis.symmetry ?? null),
       scansThisMonth: analyses.length.toString(),
     };
   }, [firstAnalysis, lastAnalysis, analyses.length]);
@@ -621,7 +669,7 @@ export default function MonthlyPhysiqueReportScreen() {
   }, [firstAnalysis, lastAnalysis]);
 
   /* ---------------------------------------------------------
-   * TRAINING STATS (NO TRAINING TIME)
+   * TRAINING STATS
    * --------------------------------------------------------*/
   const trainingStats = useMemo(() => {
     if (!workouts.length) {
@@ -661,12 +709,9 @@ export default function MonthlyPhysiqueReportScreen() {
         safeNumber(session.completed_sets) != null ||
         safeNumber(session.completed_reps) != null;
 
-      if (safeNumber(session.total_sets) != null)
-        totalSets += safeNumber(session.total_sets)!;
-      if (safeNumber(session.completed_sets) != null)
-        completedSets += safeNumber(session.completed_sets)!;
-      if (safeNumber(session.completed_reps) != null)
-        completedReps += safeNumber(session.completed_reps)!;
+      if (safeNumber(session.total_sets) != null) totalSets += safeNumber(session.total_sets)!;
+      if (safeNumber(session.completed_sets) != null) completedSets += safeNumber(session.completed_sets)!;
+      if (safeNumber(session.completed_reps) != null) completedReps += safeNumber(session.completed_reps)!;
 
       const exs = getSessionExercises(session);
       const shouldDeriveTotals = !hasTotalCols;
@@ -728,15 +773,8 @@ export default function MonthlyPhysiqueReportScreen() {
    * Workout Activity card
    * --------------------------------------------------------*/
   const renderWorkoutActivityCard = () => {
-    const {
-      sessions,
-      totalSets,
-      completedSets,
-      completedReps,
-      volume,
-      mostWorked,
-      underTrained,
-    } = trainingStats;
+    const { sessions, totalSets, completedSets, completedReps, volume, mostWorked, underTrained } =
+      trainingStats;
 
     return (
       <View style={styles.card}>
@@ -776,9 +814,7 @@ export default function MonthlyPhysiqueReportScreen() {
                 .sort((a, b) => b[1] - a[1])
                 .map(([bucket, v]) => (
                   <View key={bucket} style={styles.muscleItem}>
-                    <Text style={styles.muscleLabel}>
-                      {BUCKET_LABEL[bucket]}
-                    </Text>
+                    <Text style={styles.muscleLabel}>{BUCKET_LABEL[bucket]}</Text>
                     <Text style={styles.muscleValue}>
                       {v} set{v === 1 ? "" : "s"}
                     </Text>
@@ -798,12 +834,7 @@ export default function MonthlyPhysiqueReportScreen() {
                 )}
                 {underTrained.length > 0 && (
                   <Text style={styles.trainingHint}>
-                    <Text
-                      style={{
-                        fontWeight: "700",
-                        color: "rgba(255,255,255,0.9)",
-                      }}
-                    >
+                    <Text style={{ fontWeight: "700", color: "rgba(255,255,255,0.9)" }}>
                       Undertrained:
                     </Text>{" "}
                     {underTrained.map((b) => BUCKET_LABEL[b]).join(", ")}
@@ -828,12 +859,8 @@ export default function MonthlyPhysiqueReportScreen() {
    * Angle card with tappable photos → fullscreen modal
    * --------------------------------------------------------*/
   const renderAngleCard = (title: string, angle: "front" | "side" | "back") => {
-    const beforeUri = firstPhotos?.[
-      `${angle}Uri` as keyof PhotoSet
-    ] as string | undefined;
-    const afterUri = lastPhotos?.[
-      `${angle}Uri` as keyof PhotoSet
-    ] as string | undefined;
+    const beforeUri = firstPhotos?.[`${angle}Uri` as keyof PhotoSet] as string | undefined;
+    const afterUri = lastPhotos?.[`${angle}Uri` as keyof PhotoSet] as string | undefined;
 
     const PhotoBox = ({ uri, label }: { uri?: string; label: string }) => {
       const canOpen = !!uri;
@@ -870,15 +897,18 @@ export default function MonthlyPhysiqueReportScreen() {
           <PhotoBox uri={beforeUri} label="First scan" />
 
           <View style={styles.arrowWrapper}>
-            <Ionicons
-              name="arrow-forward"
-              size={22}
-              color={colors.accentSoft}
-            />
+            <Ionicons name="arrow-forward" size={22} color={colors.accentSoft} />
           </View>
 
           <PhotoBox uri={afterUri} label="Last scan" />
         </View>
+
+        {/* Helpful hint if photo ids weren’t stored */}
+        {(!beforeUri || !afterUri) && (
+          <Text style={{ marginTop: 10, color: colors.dim, fontSize: 12 }}>
+            Some photos aren’t available for this report (older scans saved locally only).
+          </Text>
+        )}
       </View>
     );
   };
@@ -934,14 +964,13 @@ export default function MonthlyPhysiqueReportScreen() {
             Sign in to view your report
           </Text>
           <Text style={{ color: colors.dim, textAlign: "center" }}>
-            Monthly reports are linked to your account so we can track your
-            progress over time.
+            Monthly reports are linked to your account so we can track your progress over time.
           </Text>
         </View>
       );
     }
 
-    if (!hasDataThisMonth) {
+    if (!analyses.length) {
       return (
         <ScrollView
           style={styles.scroll}
@@ -964,8 +993,8 @@ export default function MonthlyPhysiqueReportScreen() {
           <View style={[styles.card, { marginTop: 8 }]}>
             <Text style={styles.cardTitle}>No scans for this month</Text>
             <Text style={{ color: colors.dim, fontSize: 13, marginTop: 4 }}>
-              Do at least one NattyCheck scan this month and we’ll build a full
-              before/after report using your first and last scan.
+              Do at least one NattyCheck scan this month and we’ll build a full before/after report
+              using your first and last scan.
             </Text>
           </View>
 
@@ -997,26 +1026,16 @@ export default function MonthlyPhysiqueReportScreen() {
           <View style={styles.card}>
             <Text style={styles.cardTitle}>Report unlocks soon</Text>
             <Text style={{ color: colors.dim, fontSize: 13, marginTop: 4 }}>
-              We’ll generate your full monthly report using your first and last
-              scan of {monthLabel}.
+              We’ll generate your full monthly report using your first and last scan of {monthLabel}.
             </Text>
 
             <View style={{ marginTop: 16, alignItems: "center" }}>
-              <Text
-                style={{
-                  color: colors.text,
-                  fontSize: 32,
-                  fontWeight: "800",
-                }}
-              >
+              <Text style={{ color: colors.text, fontSize: 32, fontWeight: "800" }}>
                 {daysRemaining} day{daysRemaining === 1 ? "" : "s"}
               </Text>
               <Text style={{ color: colors.dim, marginTop: 4 }}>
                 Check back on{" "}
-                {endOfMonth.toLocaleDateString(undefined, {
-                  month: "short",
-                  day: "numeric",
-                })}
+                {endOfMonth.toLocaleDateString(undefined, { month: "short", day: "numeric" })}
               </Text>
             </View>
 
@@ -1024,13 +1043,7 @@ export default function MonthlyPhysiqueReportScreen() {
               <Text style={{ color: colors.dim, fontSize: 12, marginBottom: 4 }}>
                 Scans so far this month
               </Text>
-              <Text
-                style={{
-                  color: colors.accent,
-                  fontSize: 20,
-                  fontWeight: "800",
-                }}
-              >
+              <Text style={{ color: colors.accent, fontSize: 20, fontWeight: "800" }}>
                 {analyses.length}
               </Text>
             </View>
@@ -1039,13 +1052,7 @@ export default function MonthlyPhysiqueReportScreen() {
               <Text style={{ color: colors.dim, fontSize: 12, marginBottom: 4 }}>
                 Workouts logged this month
               </Text>
-              <Text
-                style={{
-                  color: colors.accent,
-                  fontSize: 20,
-                  fontWeight: "800",
-                }}
-              >
+              <Text style={{ color: colors.accent, fontSize: 20, fontWeight: "800" }}>
                 {trainingStats.sessions}
               </Text>
             </View>
@@ -1057,9 +1064,11 @@ export default function MonthlyPhysiqueReportScreen() {
     }
 
     // Month complete → full report
+    const firstAnalysis = analyses[0];
+    const lastAnalysis = analyses[analyses.length - 1];
+
     const showTrendPill =
-      keyImprovements.scoreDelta.startsWith("+") ||
-      keyImprovements.scoreDelta.startsWith("-");
+      keyImprovements.scoreDelta.startsWith("+") || keyImprovements.scoreDelta.startsWith("-");
 
     return (
       <ScrollView
@@ -1075,8 +1084,6 @@ export default function MonthlyPhysiqueReportScreen() {
               <Text style={styles.monthText}>{monthLabel}</Text>
             </View>
 
-            {/* ✅ Removed "Stable" concept:
-                only show this pill if it's clearly Improved/Declined */}
             {showTrendPill && (
               <View style={styles.trendPill}>
                 <Ionicons
@@ -1090,9 +1097,7 @@ export default function MonthlyPhysiqueReportScreen() {
                   style={{ marginRight: 4 }}
                 />
                 <Text style={styles.trendText}>
-                  {keyImprovements.scoreDelta.startsWith("+")
-                    ? "Improved"
-                    : "Declined"}
+                  {keyImprovements.scoreDelta.startsWith("+") ? "Improved" : "Declined"}
                 </Text>
               </View>
             )}
@@ -1114,32 +1119,24 @@ export default function MonthlyPhysiqueReportScreen() {
           <View style={styles.keyRow}>
             <View style={styles.keyItem}>
               <Text style={styles.keyLabel}>Physique Score</Text>
-              <Text style={styles.keyValuePositive}>
-                {keyImprovements.scoreDelta}
-              </Text>
+              <Text style={styles.keyValuePositive}>{keyImprovements.scoreDelta}</Text>
             </View>
 
             <View style={styles.keyItem}>
               <Text style={styles.keyLabel}>Body Fat</Text>
-              <Text style={styles.keyValuePositive}>
-                {keyImprovements.bodyfatDelta}
-              </Text>
+              <Text style={styles.keyValuePositive}>{keyImprovements.bodyfatDelta}</Text>
             </View>
           </View>
 
           <View style={[styles.keyRow, { marginTop: 14 }]}>
             <View style={styles.keyItem}>
               <Text style={styles.keyLabel}>Symmetry</Text>
-              <Text style={styles.keyValuePositive}>
-                {keyImprovements.symmetryDelta}
-              </Text>
+              <Text style={styles.keyValuePositive}>{keyImprovements.symmetryDelta}</Text>
             </View>
 
             <View style={styles.keyItem}>
               <Text style={styles.keyLabel}>Scans</Text>
-              <Text style={styles.keyValueNeutral}>
-                {keyImprovements.scansThisMonth}
-              </Text>
+              <Text style={styles.keyValueNeutral}>{keyImprovements.scansThisMonth}</Text>
             </View>
           </View>
         </View>
@@ -1169,34 +1166,23 @@ export default function MonthlyPhysiqueReportScreen() {
 
           <View style={styles.summaryRow}>
             <Text style={styles.summaryLabel}>First Scan</Text>
-            <Text style={styles.summaryValue}>
-              {formatShortDate(firstAnalysis.created_at)}
-            </Text>
+            <Text style={styles.summaryValue}>{formatShortDate(firstAnalysis.created_at)}</Text>
           </View>
 
           <View style={styles.summaryRow}>
             <Text style={styles.summaryLabel}>Last Scan</Text>
-            <Text style={styles.summaryValue}>
-              {formatShortDate(lastAnalysis.created_at)}
-            </Text>
+            <Text style={styles.summaryValue}>{formatShortDate(lastAnalysis.created_at)}</Text>
           </View>
         </View>
 
         <TouchableOpacity onPress={handleShare} style={styles.shareWrapper}>
           <LinearGradient colors={gradient} style={styles.shareButton}>
-            <Ionicons
-              name="share-outline"
-              size={18}
-              color="#00110A"
-              style={{ marginRight: 6 }}
-            />
+            <Ionicons name="share-outline" size={18} color="#00110A" style={{ marginRight: 6 }} />
             <Text style={styles.shareText}>Share</Text>
           </LinearGradient>
         </TouchableOpacity>
 
-        <Text style={styles.footerHint}>
-          You’re the only one who sees this until you share it.
-        </Text>
+        <Text style={styles.footerHint}>You’re the only one who sees this until you share it.</Text>
       </ScrollView>
     );
   };
@@ -1206,7 +1192,7 @@ export default function MonthlyPhysiqueReportScreen() {
       {header}
       <SafeAreaView style={styles.safe}>{body()}</SafeAreaView>
 
-      {/* ✅ Fullscreen photo modal (renders once, works everywhere) */}
+      {/* Fullscreen photo modal */}
       <Modal
         visible={photoViewer.open}
         transparent
@@ -1276,7 +1262,6 @@ const styles = StyleSheet.create({
   center: { flex: 1, justifyContent: "center", alignItems: "center" },
 
   header: {
-    // NOTE: actual top padding is handled via ScrollView contentContainerStyle
     paddingBottom: 16,
   },
   headerTitle: {

@@ -1,19 +1,12 @@
 // app/analyzing.tsx
 import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
-import {
-  View,
-  Text,
-  StyleSheet,
-  Dimensions,
-  ActivityIndicator,
-} from "react-native";
+import { View, Text, StyleSheet, Dimensions, ActivityIndicator } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import { useRouter } from "expo-router";
 
 import { useResultsStore } from "@/store/useResultsStore";
 import { useCaptureStore } from "@/store/useCaptureStore";
 import { useAuthStore } from "@/store/useAuthStore";
-import { savePhotoHistory } from "@/lib/photoHistory";
 import { postAnalyze } from "@/lib/api";
 import * as FileSystem from "expo-file-system/legacy";
 import { nanoid } from "nanoid/non-secure";
@@ -52,18 +45,48 @@ function isSuccessPayload(json: any): boolean {
   if (json.success === true) return true;
   if (json.ok === true) return true;
 
-  const hasScore =
-    typeof json.score === "number" || typeof json.gptScore === "number";
+  const hasScore = typeof json.score === "number" || typeof json.gptScore === "number";
   const hasGroups = !!json.groups && typeof json.groups === "object";
   const hasBodyfat = json.bodyfat !== undefined && json.bodyfat !== null;
+
   return hasScore || (hasGroups && hasBodyfat);
+}
+
+type Stage = "preparing" | "session" | "reading" | "request" | "uploading" | "saving" | "finishing";
+
+/**
+ * Upload a local file URI into Supabase Storage bucket `user-photos`
+ * at: `${userId}/${analysisId}/${angle}.jpg`
+ */
+async function uploadAngleToStorage(params: {
+  userId: string;
+  analysisId: string;
+  angle: "front" | "side" | "back";
+  localUri: string;
+}) {
+  const { userId, analysisId, angle, localUri } = params;
+
+  const path = `${userId}/${analysisId}/${angle}.jpg`;
+
+  // Convert local file -> blob
+  const resp = await fetch(localUri);
+  const blob = await resp.blob();
+
+  const { error } = await supabase.storage.from("user-photos").upload(path, blob, {
+    contentType: "image/jpeg",
+    upsert: true,
+  });
+
+  if (error) throw error;
+
+  return path;
 }
 
 export default function AnalyzingScreen() {
   const router = useRouter();
   const saveResult = useResultsStore((s) => s.setLast);
 
-  // ✅ use STORE hydration flags (reactive) instead of persist.hasHydrated()
+  // ✅ hydration flags
   const hasHydratedAuth = useAuthStore((s) => s.hasHydrated);
   const hasBootstrappedSession = useAuthStore((s) => s.hasBootstrappedSession);
 
@@ -72,9 +95,7 @@ export default function AnalyzingScreen() {
 
   const [progress, setProgress] = useState(0);
   const [isFinishing, setIsFinishing] = useState(false);
-  const [stage, setStage] = useState<
-    "preparing" | "session" | "reading" | "request" | "finishing"
-  >("preparing");
+  const [stage, setStage] = useState<Stage>("preparing");
 
   // Fake progress animation
   useEffect(() => {
@@ -89,7 +110,7 @@ export default function AnalyzingScreen() {
     return () => clearInterval(t);
   }, [isFinishing]);
 
-  const readBase64 = useCallback(async (uri?: string) => {
+  const readBase64FromUri = useCallback(async (uri?: string) => {
     if (!uri) return "";
     try {
       const b64 = await FileSystem.readAsStringAsync(uri, { encoding: "base64" });
@@ -143,7 +164,6 @@ export default function AnalyzingScreen() {
   );
 
   const ensureSessionReady = useCallback(async () => {
-    // up to ~4s (covers “just logged in” hydration)
     const attempts = 14;
 
     for (let i = 0; i < attempts; i++) {
@@ -157,10 +177,7 @@ export default function AnalyzingScreen() {
           try {
             await supabase.auth.refreshSession();
           } catch (e) {
-            console.log(
-              "🟨 refreshSession failed (non-fatal):",
-              (e as any)?.message ?? e
-            );
+            console.log("🟨 refreshSession failed (non-fatal):", (e as any)?.message ?? e);
           }
         }
         return session;
@@ -172,18 +189,93 @@ export default function AnalyzingScreen() {
     return null;
   }, []);
 
+  /**
+   * Best-effort DB persistence.
+   * - analysis_history: core metrics used by your app
+   * - analysis_photos: storage paths to make photos survive reinstall
+   */
+  const persistToDb = useCallback(async (args: {
+    analysisId: string;
+    userId: string;
+    createdAtISO: string;
+    payload: any;
+    photoPaths: { front: string; side: string; back: string };
+  }) => {
+    const { analysisId, userId, createdAtISO, payload, photoPaths } = args;
+
+    // 1) Link photos
+    const photosRes = await supabase
+      .from("analysis_photos")
+      .upsert(
+        {
+          analysis_id: analysisId,
+          user_id: userId,
+          front_path: photoPaths.front,
+          side_path: photoPaths.side,
+          back_path: photoPaths.back,
+          created_at: createdAtISO,
+        } as any,
+        { onConflict: "analysis_id" }
+      )
+      .select("analysis_id")
+      .maybeSingle();
+
+    if (photosRes.error) {
+      console.log("🟥 analysis_photos upsert failed:", photosRes.error.message);
+    }
+
+    // 2) Save analysis row (best effort)
+    // Only include columns you’re very likely to have based on your Monthly Report types.
+    const analysisRow: any = {
+      id: analysisId,
+      user_id: userId,
+      created_at: createdAtISO,
+
+      score: typeof payload?.score === "number" ? payload.score : payload?.gptScore ?? null,
+      bodyfat: payload?.bodyfat ?? null,
+      symmetry: payload?.symmetry ?? null,
+      confidence: payload?.confidence ?? null,
+      type: payload?.type ?? null,
+      muscles: payload?.muscles ?? null,
+    };
+
+    const histRes = await supabase.from("analysis_history").insert(analysisRow as any).select("id").maybeSingle();
+
+    if (histRes.error) {
+      // If it already exists (because backend inserted it), try update instead.
+      const upd = await supabase
+        .from("analysis_history")
+        .update({
+          score: analysisRow.score,
+          bodyfat: analysisRow.bodyfat,
+          symmetry: analysisRow.symmetry,
+          confidence: analysisRow.confidence,
+          type: analysisRow.type,
+          muscles: analysisRow.muscles,
+        })
+        .eq("id", analysisId)
+        .select("id")
+        .maybeSingle();
+
+      if (upd.error) {
+        console.log("🟥 analysis_history insert/update failed:", histRes.error.message, upd.error.message);
+      }
+    }
+  }, []);
+
   const subtitle = useMemo(() => {
     if (!hasHydratedAuth) return "Preparing login…";
     if (!hasBootstrappedSession) return "Restoring session…";
     if (stage === "session") return "Preparing secure session…";
     if (stage === "reading") return "Preparing photos…";
     if (stage === "request") return "Sending to AI…";
+    if (stage === "uploading") return "Uploading photos…";
+    if (stage === "saving") return "Saving results…";
     if (stage === "finishing") return "Finalizing…";
     return "Combining angles and evaluating proportions…";
   }, [hasHydratedAuth, hasBootstrappedSession, stage]);
 
   useEffect(() => {
-    // ✅ don’t run until auth store is hydrated AND bootstrap finished
     if (!hasHydratedAuth) return;
     if (!hasBootstrappedSession) return;
 
@@ -196,8 +288,7 @@ export default function AnalyzingScreen() {
         goInvalid({
           badAngle: "front",
           reason: "analysis_timeout",
-          message:
-            "Analysis is taking too long. Please try again (or check your connection).",
+          message: "Analysis is taking too long. Please try again (or check your connection).",
         });
       }, HARD_TIMEOUT_MS);
 
@@ -212,14 +303,16 @@ export default function AnalyzingScreen() {
           goInvalid({
             badAngle: "front",
             reason: "not_authenticated",
-            message:
-              "You’re signed out. Please log in again and retry.",
+            message: "You’re signed out. Please log in again and retry.",
           });
           return;
         }
 
-        // Pull photo URIs
+        const userId = session.user.id;
+
+        // Pull capture state
         const { front, side, back } = useCaptureStore.getState();
+
         const frontUri = front?.uri;
         const sideUri = side?.uri;
         const backUri = back?.uri;
@@ -234,12 +327,13 @@ export default function AnalyzingScreen() {
           return;
         }
 
-        // Convert to base64
+        // Prefer stored base64 from capture; fallback to reading file
         setStage("reading");
+
         const [front64, side64, back64] = await Promise.all([
-          readBase64(frontUri),
-          readBase64(sideUri),
-          readBase64(backUri),
+          front?.base64?.trim() ? front.base64.trim() : readBase64FromUri(frontUri),
+          side?.base64?.trim() ? side.base64.trim() : readBase64FromUri(sideUri),
+          back?.base64?.trim() ? back.base64.trim() : readBase64FromUri(backUri),
         ]);
 
         if (!front64 || !side64 || !back64) {
@@ -252,28 +346,13 @@ export default function AnalyzingScreen() {
           return;
         }
 
-        console.log("📨 Analyze authed POST:", {
-          uid: session.user.id,
-          frontLen: front64.length,
-          sideLen: side64.length,
-          backLen: back64.length,
-        });
-
         // Send to backend
         setStage("request");
+
         let res = await postAnalyze({
           frontBase64: front64,
           sideBase64: side64,
           backBase64: back64,
-        });
-
-        console.log("🧾 Analyze response:", {
-          ok: res.ok,
-          status: res.status,
-          endpointUsed: res.endpointUsed,
-          keys:
-            res.data && typeof res.data === "object" ? Object.keys(res.data) : [],
-          rawPreview: (res.raw || "").slice(0, 120),
         });
 
         // If 401, refresh once and retry once
@@ -282,19 +361,11 @@ export default function AnalyzingScreen() {
             await supabase.auth.refreshSession();
           } catch {}
 
-          const retry = await postAnalyze({
+          res = await postAnalyze({
             frontBase64: front64,
             sideBase64: side64,
             backBase64: back64,
           });
-
-          console.log("🧾 Analyze retry:", {
-            ok: retry.ok,
-            status: retry.status,
-            endpointUsed: retry.endpointUsed,
-          });
-
-          res = retry;
 
           if (res.status === 401) {
             clearWatchdog();
@@ -307,7 +378,7 @@ export default function AnalyzingScreen() {
           }
         }
 
-        // Network / timeout from wrapper
+        // Wrapper network / timeout
         if (res.status === 0) {
           clearWatchdog();
           goInvalid({
@@ -323,8 +394,7 @@ export default function AnalyzingScreen() {
           goInvalid({
             badAngle: "front",
             reason: "rate_limited",
-            message:
-              "You’re analyzing too frequently. Please wait a moment and try again.",
+            message: "You’re analyzing too frequently. Please wait a moment and try again.",
           });
           return;
         }
@@ -334,8 +404,7 @@ export default function AnalyzingScreen() {
           goInvalid({
             badAngle: "front",
             reason: "payload_too_large",
-            message:
-              "Those photos are too large for analysis. Retake them a bit farther away and try again.",
+            message: "Those photos are too large for analysis. Retake them a bit farther away and try again.",
           });
           return;
         }
@@ -352,20 +421,13 @@ export default function AnalyzingScreen() {
 
         const json = res.data;
 
-        if (
-          json &&
-          typeof json === "object" &&
-          ((json as any).success === false || (json as any).ok === false)
-        ) {
+        // Explicit failure payload
+        if (json && typeof json === "object" && ((json as any).success === false || (json as any).ok === false)) {
           clearWatchdog();
           goInvalid({
             badAngle: normalizeBadAngle((json as any).badAngle),
-            reason: normalizeFailureReason(
-              (json as any).reason || (json as any).reasonCode
-            ),
-            message: normalizeFailureMessage(
-              (json as any).message || (json as any).reason
-            ),
+            reason: normalizeFailureReason((json as any).reason || (json as any).reasonCode),
+            message: normalizeFailureMessage((json as any).message || (json as any).reason),
           });
           return;
         }
@@ -383,19 +445,70 @@ export default function AnalyzingScreen() {
 
         // Ensure id + timestamp
         const analysisId =
-          (json as any).id ||
-          (json as any).analysisId ||
-          (json as any).report_id ||
-          nanoid();
-
+          (json as any).id || (json as any).analysisId || (json as any).report_id || nanoid();
         (json as any).id = analysisId;
-        (json as any).created_at =
-          typeof (json as any).created_at === "string"
-            ? (json as any).created_at
-            : new Date().toISOString();
 
-        // Save photos locally
-        savePhotoHistory(analysisId, { frontUri, sideUri, backUri });
+        const createdAtISO =
+          typeof (json as any).created_at === "string" ? (json as any).created_at : new Date().toISOString();
+        (json as any).created_at = createdAtISO;
+
+        // ✅ Upload photos to Supabase Storage (this is what makes them survive reinstall)
+        setStage("uploading");
+
+        let photoPaths: { front: string; side: string; back: string } | null = null;
+
+        try {
+          const [frontPath, sidePath, backPath] = await Promise.all([
+            uploadAngleToStorage({ userId, analysisId, angle: "front", localUri: frontUri }),
+            uploadAngleToStorage({ userId, analysisId, angle: "side", localUri: sideUri }),
+            uploadAngleToStorage({ userId, analysisId, angle: "back", localUri: backUri }),
+          ]);
+
+          photoPaths = { front: frontPath, side: sidePath, back: backPath };
+        } catch (e: any) {
+          console.log("🟥 photo upload failed (non-fatal):", e?.message ?? e);
+        }
+
+        // ✅ Persist DB links + analysis (best effort)
+        setStage("saving");
+
+        if (photoPaths) {
+          await persistToDb({
+            analysisId,
+            userId,
+            createdAtISO,
+            payload: json,
+            photoPaths,
+          });
+        } else {
+          // Still try saving analysis history even if photo upload failed
+          const analysisRow: any = {
+            id: analysisId,
+            user_id: userId,
+            created_at: createdAtISO,
+            score: typeof json?.score === "number" ? json.score : json?.gptScore ?? null,
+            bodyfat: json?.bodyfat ?? null,
+            symmetry: json?.symmetry ?? null,
+            confidence: json?.confidence ?? null,
+            type: json?.type ?? null,
+            muscles: json?.muscles ?? null,
+          };
+
+          const histRes = await supabase.from("analysis_history").insert(analysisRow as any).select("id").maybeSingle();
+          if (histRes.error) {
+            await supabase
+              .from("analysis_history")
+              .update({
+                score: analysisRow.score,
+                bodyfat: analysisRow.bodyfat,
+                symmetry: analysisRow.symmetry,
+                confidence: analysisRow.confidence,
+                type: analysisRow.type,
+                muscles: analysisRow.muscles,
+              })
+              .eq("id", analysisId);
+          }
+        }
 
         clearWatchdog();
         await finishAndNavigate(json);
@@ -404,20 +517,20 @@ export default function AnalyzingScreen() {
         goInvalid({
           badAngle: "front",
           reason: "analysis_crash",
-          message:
-            "Something went wrong while analyzing your photos. Please try again.",
+          message: "Something went wrong while analyzing your photos. Please try again.",
         });
       }
     };
 
-    run();
+    void run();
   }, [
     hasHydratedAuth,
     hasBootstrappedSession,
     ensureSessionReady,
-    readBase64,
+    readBase64FromUri,
     goInvalid,
     finishAndNavigate,
+    persistToDb,
   ]);
 
   return (
