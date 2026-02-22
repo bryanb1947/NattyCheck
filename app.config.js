@@ -7,6 +7,8 @@ export default ({ config }) => {
   // With EAS, that maps to expo.ios.buildNumber (string). Bump every upload.
   const IOS_BUILD_NUMBER = "2";
 
+  const EAS_PROJECT_ID = "72775517-8816-4db0-a8b8-f8a8938aff48";
+
   return {
     ...config,
 
@@ -25,7 +27,19 @@ export default ({ config }) => {
     splash: {
       image: "./assets/images/splash-icon.png",
       resizeMode: "contain",
-      backgroundColor: "#0A0B0C",
+      backgroundColor: "#0A0B0C"
+    },
+
+    /**
+     * ✅ EAS Update wiring
+     * This enables `eas update --channel development` to deliver JS/asset updates
+     * to your installed dev client build (no App Store/TestFlight rebuild).
+     */
+    updates: {
+      url: `https://u.expo.dev/${EAS_PROJECT_ID}`
+    },
+    runtimeVersion: {
+      policy: "appVersion"
     },
 
     ios: {
@@ -34,24 +48,23 @@ export default ({ config }) => {
       buildNumber: IOS_BUILD_NUMBER,
 
       // Native Sign in with Apple capability (prevents web OAuth sheet)
-      usesAppleSignIn: true,
+      usesAppleSignIn: true
     },
 
     android: {
       ...(config.android ?? {}),
-      package: androidPackage,
+      package: androidPackage
     },
 
     extra: {
       ...(config.extra ?? {}),
-
       eas: {
-        projectId: "72775517-8816-4db0-a8b8-f8a8938aff48",
+        projectId: EAS_PROJECT_ID
       },
 
       EXPO_PUBLIC_REVENUECAT_IOS_KEY: process.env.EXPO_PUBLIC_REVENUECAT_IOS_KEY,
       EXPO_PUBLIC_API_URL: process.env.EXPO_PUBLIC_API_URL,
-      EXPO_PUBLIC_TIMEOUT_MS: process.env.EXPO_PUBLIC_TIMEOUT_MS,
-    },
+      EXPO_PUBLIC_TIMEOUT_MS: process.env.EXPO_PUBLIC_TIMEOUT_MS
+    }
   };
 };
