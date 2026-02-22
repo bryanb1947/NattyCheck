@@ -1,28 +1,21 @@
 // app.config.js
 export default ({ config }) => {
-  const iosBundleId = config.ios?.bundleIdentifier ?? "com.bryanb1947.nattycheck";
-  const androidPackage = config.android?.package ?? "com.bryanb1947.nattycheck";
+  const iosBundleId =
+    config.ios?.bundleIdentifier ?? "com.bryanb1947.nattycheck";
+  const androidPackage =
+    config.android?.package ?? "com.bryanb1947.nattycheck";
 
-  // Apple/TestFlight requires CFBundleVersion to be unique per upload.
-  // With EAS, that maps to expo.ios.buildNumber (string). Bump every upload.
   const IOS_BUILD_NUMBER = "2";
-
   const EAS_PROJECT_ID = "72775517-8816-4db0-a8b8-f8a8938aff48";
 
   return {
     ...config,
 
-    // ✅ EAS owner/org
     owner: "nattycheck",
-
-    // ✅ Deep link scheme
     scheme: config.scheme ?? "nattycheck",
-
-    // ✅ App identity
     name: config.name ?? "NattyCheck",
     slug: config.slug ?? "nattycheck",
 
-    // ✅ App icon + splash
     icon: "./assets/images/icon.png",
     splash: {
       image: "./assets/images/splash-icon.png",
@@ -30,24 +23,17 @@ export default ({ config }) => {
       backgroundColor: "#0A0B0C"
     },
 
-    /**
-     * ✅ EAS Update wiring
-     * This enables `eas update --channel development` to deliver JS/asset updates
-     * to your installed dev client build (no App Store/TestFlight rebuild).
-     */
     updates: {
       url: `https://u.expo.dev/${EAS_PROJECT_ID}`
     },
-    runtimeVersion: {
-      policy: "appVersion"
-    },
+
+    // ✅ REQUIRED for bare workflow
+    runtimeVersion: "1.0.0",
 
     ios: {
       ...(config.ios ?? {}),
       bundleIdentifier: iosBundleId,
       buildNumber: IOS_BUILD_NUMBER,
-
-      // Native Sign in with Apple capability (prevents web OAuth sheet)
       usesAppleSignIn: true
     },
 
@@ -62,7 +48,8 @@ export default ({ config }) => {
         projectId: EAS_PROJECT_ID
       },
 
-      EXPO_PUBLIC_REVENUECAT_IOS_KEY: process.env.EXPO_PUBLIC_REVENUECAT_IOS_KEY,
+      EXPO_PUBLIC_REVENUECAT_IOS_KEY:
+        process.env.EXPO_PUBLIC_REVENUECAT_IOS_KEY,
       EXPO_PUBLIC_API_URL: process.env.EXPO_PUBLIC_API_URL,
       EXPO_PUBLIC_TIMEOUT_MS: process.env.EXPO_PUBLIC_TIMEOUT_MS
     }
