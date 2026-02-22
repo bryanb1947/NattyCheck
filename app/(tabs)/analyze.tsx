@@ -1,4 +1,4 @@
-// app/tabs/analyze.tsx
+// app/(tabs)/analyze.tsx
 import React, { useMemo, useCallback } from "react";
 import {
   View,
@@ -10,7 +10,7 @@ import {
   StatusBar,
   Alert,
 } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { LinearGradient } from "expo-linear-gradient";
 import { Ionicons, MaterialIcons, Feather } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -42,86 +42,69 @@ type Tip = {
   desc?: string;
 };
 
-// --- helpers ---
-async function getOnboardingCompleteFromStorage(): Promise<boolean> {
-  // Your logs show an onboarding “draft” object being saved.
-  // We’ll safely check a few likely keys and shapes.
-  const keysToTry = [
-    "onboarding_draft",
-    "onboardingDraft",
-    "onboarding",
-    "onboarding_state",
-  ];
-
-  for (const k of keysToTry) {
-    try {
-      const raw = await AsyncStorage.getItem(k);
-      if (!raw) continue;
-
-      // some apps store "true"/"false"
-      if (raw === "true") return true;
-
-      const obj = JSON.parse(raw);
-      if (obj && typeof obj === "object") {
-        if (obj.onboarding_complete === true) return true;
-        if (obj.completed === true) return true;
-        if (obj.onboardingComplete === true) return true;
-      }
-    } catch {
-      // ignore bad JSON / missing keys
-    }
-  }
-
-  return false;
-}
-
 export default function Analyze() {
   const tabBarHeight = useBottomTabBarHeight();
+  const insets = useSafeAreaInsets();
 
   const clearCapture = useCaptureStore((s) => s.clearAll);
 
   const userId = useAuthStore((s) => s.userId);
+  const onboardingComplete = useAuthStore((s) => s.onboardingComplete);
+
+  // IMPORTANT:
+  // - bootstrapAuth() is restore-only (no anon creation).
+  // - ensureGuestSession() is the explicit anon creation path.
   const bootstrapAuth = useAuthStore((s) => s.bootstrapAuth);
+  const ensureGuestSession = useAuthStore((s) => s.ensureGuestSession);
 
   const handleStart = useCallback(async () => {
     try {
-      // 1) Make sure onboarding happened first
-      const onboardingDone = await getOnboardingCompleteFromStorage();
-      if (!onboardingDone) {
+      // prove tap is firing
+      console.log("✅ Begin Capture pressed", {
+        userId: useAuthStore.getState().userId,
+        plan: useAuthStore.getState().plan,
+        onboardingComplete: useAuthStore.getState().onboardingComplete,
+      });
+
+      // Gate onboarding from the store (source of truth)
+      if (!onboardingComplete) {
         router.push("/onboarding");
         return;
       }
 
-      // 2) Make sure we have a session (anon is fine)
-      // If userId missing, bootstrap will restore/create anon.
-      if (!userId) {
+      // Ensure auth store is populated (restore session if needed)
+      if (!useAuthStore.getState().userId) {
         await bootstrapAuth();
       }
 
-      // Re-check after bootstrap
+      // If still no user, create guest session (this only happens if truly no session)
+      if (!useAuthStore.getState().userId) {
+        await ensureGuestSession();
+      }
+
       const nextUserId = useAuthStore.getState().userId;
       if (!nextUserId) {
         Alert.alert(
           "Session not ready",
-          "We couldn’t start a guest session. Please close and reopen the app and try again."
+          "We couldn’t initialize a session. Fully close the app and reopen, then try again."
         );
         return;
       }
 
-      // 3) Clear prior capture + lastAnalysis
+      // Clear capture state
       clearCapture();
       await AsyncStorage.removeItem("lastAnalysis");
 
-      // 4) Go to capture
+      // Navigate
       router.push({
         pathname: "/capture",
-        params: { photoIndex: 0 },
+        params: { photoIndex: "0" },
       });
     } catch (e: any) {
       console.log("❌ Analyze.handleStart error:", e?.message ?? e);
       Alert.alert("Error", "Could not start capture. Please try again.");
     }
-  }, [userId, bootstrapAuth, clearCapture]);
+  }, [onboardingComplete, bootstrapAuth, ensureGuestSession, clearCapture]);
 
   const tips = useMemo<Tip[]>(
     () => [
@@ -149,19 +132,15 @@ export default function Analyze() {
     []
   );
 
+  const bottomPad = tabBarHeight + Math.max(insets.bottom, 12) + 24;
+
   return (
-    <SafeAreaView
-      style={styles.safe}
-      edges={["top", "left", "right", "bottom"]}
-    >
+    <SafeAreaView style={styles.safe} edges={["top", "left", "right"]}>
       <StatusBar barStyle="light-content" />
 
       <ScrollView
         showsVerticalScrollIndicator={false}
-        contentContainerStyle={[
-          styles.scroll,
-          { paddingBottom: tabBarHeight + 48 },
-        ]}
+        contentContainerStyle={[styles.scroll, { paddingBottom: bottomPad }]}
       >
         {/* HERO */}
         <View style={styles.heroWrap}>
@@ -185,8 +164,7 @@ export default function Analyze() {
                 <View style={{ flex: 1 }}>
                   <Text style={styles.title}>Start your scan</Text>
                   <Text style={styles.subtitle}>
-                    Take 3 photos (front • side • back). The AI has strict
-                    validation.
+                    Take 3 photos (front • side • back). The AI has strict validation.
                   </Text>
                 </View>
               </View>
@@ -198,11 +176,7 @@ export default function Analyze() {
                   <Text style={styles.metaText}>~30s</Text>
                 </View>
                 <View style={styles.metaPill}>
-                  <Ionicons
-                    name="lock-closed-outline"
-                    size={14}
-                    color="#CFFFA6"
-                  />
+                  <Ionicons name="lock-closed-outline" size={14} color="#CFFFA6" />
                   <Text style={styles.metaText}>On-device photos</Text>
                 </View>
               </View>
@@ -230,9 +204,7 @@ export default function Analyze() {
               <Ionicons name="shirt-outline" size={18} color={C.warn} />
             </View>
             <Text style={styles.reqTitle}>Shirtless</Text>
-            <Text style={styles.reqDesc}>
-              No shirts, hoodies, or compression tops.
-            </Text>
+            <Text style={styles.reqDesc}>No shirts, hoodies, or compression tops.</Text>
           </View>
 
           <View style={styles.reqCard}>
@@ -240,9 +212,7 @@ export default function Analyze() {
               <Ionicons name="body-outline" size={18} color={C.warn} />
             </View>
             <Text style={styles.reqTitle}>Shorts or underwear</Text>
-            <Text style={styles.reqDesc}>
-              Legs must be visible for accurate scoring.
-            </Text>
+            <Text style={styles.reqDesc}>Legs must be visible for accurate scoring.</Text>
           </View>
         </View>
 
@@ -288,7 +258,6 @@ const styles = StyleSheet.create({
   scroll: {
     paddingHorizontal: 18,
     paddingTop: Platform.OS === "android" ? 10 : 6,
-    paddingBottom: 28, // overridden dynamically in contentContainerStyle
   },
 
   /* HERO */
@@ -324,7 +293,6 @@ const styles = StyleSheet.create({
     color: C.dim,
     fontSize: 13,
     lineHeight: 18,
-    maxWidth: 360,
   },
   metaRow: {
     flexDirection: "row",
