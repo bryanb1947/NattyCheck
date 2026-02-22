@@ -1,8 +1,20 @@
 // app/_layout.tsx
-import { Stack, useSegments, useRouter, useLocalSearchParams } from "expo-router";
+import {
+  Stack,
+  useSegments,
+  useRouter,
+  useLocalSearchParams,
+} from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { ActivityIndicator, Platform, StyleSheet, Text } from "react-native";
+import {
+  ActivityIndicator,
+  Image,
+  Platform,
+  StyleSheet,
+  Text,
+  View,
+} from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
@@ -46,16 +58,18 @@ export default function RootLayout() {
 
   const userId = useAuthStore((s) => s.userId);
   const plan = useAuthStore((s) => s.plan); // "free" | "pro"
-  const onboardingComplete = useAuthStore((s) => !!(s as any).onboardingComplete);
+  const onboardingComplete = useAuthStore(
+    (s) => !!(s as any).onboardingComplete
+  );
   const hasHydrated = useAuthStore((s) => s.hasHydrated);
 
   const startAuthListener = useAuthStore((s) => s.startAuthListener);
   const stopAuthListener = useAuthStore((s) => s.stopAuthListener);
 
+  // Local boot gates (these must always resolve, even if hydration misbehaves)
   const [layoutReady, setLayoutReady] = useState(false);
-
-  // ✅ Cold-start gate to prevent “login flash”
   const [bootChecked, setBootChecked] = useState(false);
+  const [hydrationTimedOut, setHydrationTimedOut] = useState(false);
 
   const didInitAuth = useRef(false);
   const didInitRevenueCatFor = useRef<string | null>(null);
@@ -69,6 +83,7 @@ export default function RootLayout() {
     if (lastRedirectRef.current === key) return;
     lastRedirectRef.current = key;
 
+    // Defer to next tick to avoid "navigation during render" edge cases
     setTimeout(() => {
       if (p) router.replace({ pathname: to as any, params: p } as any);
       else router.replace(to as any);
@@ -80,10 +95,9 @@ export default function RootLayout() {
   }, []);
 
   /**
-   * ✅ IMPORTANT:
-   * - No anon creation on boot.
-   * - Listener is allowed, but we suppress guest restore to prevent
-   *   “signed out => create anon” behavior during cold start.
+   * ✅ Start auth listener once
+   * We keep the listener to receive auth changes.
+   * We also suppress any "guest restore" behavior during cold start.
    */
   useEffect(() => {
     if (didInitAuth.current) return;
@@ -95,9 +109,11 @@ export default function RootLayout() {
     return () => stopAuthListener();
   }, [startAuthListener, stopAuthListener]);
 
+  /**
+   * ✅ Layout ready immediately
+   */
   useEffect(() => {
-    const t = setTimeout(() => setLayoutReady(true), 0);
-    return () => clearTimeout(t);
+    setLayoutReady(true);
   }, []);
 
   const routeInfo = useMemo(() => {
@@ -110,7 +126,6 @@ export default function RootLayout() {
     const isSignup = first === "signup";
     const isPaywall = first === "paywall";
     const isAuthCallback = first === "auth-callback";
-
     const inAuthSurface = isLogin || isSignup || isLink;
 
     return {
@@ -132,13 +147,38 @@ export default function RootLayout() {
   }, [routeInfo.first]);
 
   /**
+   * ✅ HYDRATION WATCHDOG
+   * If Zustand hydration never flips hasHydrated=true, the app would otherwise
+   * hang forever on the boot screen. This forces progress after a short timeout.
+   */
+  useEffect(() => {
+    if (!layoutReady) return;
+    if (hasHydrated) return;
+
+    const t = setTimeout(() => {
+      if (!useAuthStore.getState().hasHydrated) {
+        console.log("🟧 [_layout] hydration timeout — continuing boot anyway.");
+        setHydrationTimedOut(true);
+      }
+    }, 1500);
+
+    return () => clearTimeout(t);
+  }, [layoutReady, hasHydrated]);
+
+  /**
    * ✅ BOOT CHECK (NO ANON CREATION)
    * - If existing session: bootstrapAuth() to fetch plan/onboarding gates
    * - If no session: do nothing (user decides Get Started / Log In)
+   *
+   * IMPORTANT: This MUST always set bootChecked=true in finally.
    */
   useEffect(() => {
-    if (!layoutReady || !hasHydrated) return;
+    if (!layoutReady) return;
     if (bootChecked) return;
+
+    // If hydration is required for bootstrapAuth in your store, we wait for it,
+    // but we will not hang forever (hydrationTimedOut breaks the wait).
+    if (!hasHydrated && !hydrationTimedOut) return;
 
     (async () => {
       try {
@@ -156,7 +196,10 @@ export default function RootLayout() {
           try {
             await useAuthStore.getState().bootstrapAuth();
           } catch (e: any) {
-            console.log("🟨 [_layout] bootstrapAuth on boot failed:", e?.message ?? e);
+            console.log(
+              "🟨 [_layout] bootstrapAuth on boot failed:",
+              e?.message ?? e
+            );
           }
         } else {
           console.log("🟦 [_layout] no session on boot (no anon created).");
@@ -167,10 +210,15 @@ export default function RootLayout() {
         setBootChecked(true);
       }
     })();
-  }, [bootChecked, hasHydrated, layoutReady]);
+  }, [layoutReady, hasHydrated, hydrationTimedOut, bootChecked]);
 
+  /**
+   * ✅ Post-boot routing + RevenueCat init
+   */
   useEffect(() => {
-    if (!layoutReady || !hasHydrated || !bootChecked) return;
+    if (!layoutReady) return;
+    if (!bootChecked) return;
+    if (!hasHydrated && !hydrationTimedOut) return;
 
     const { inTabs, isLogin, inAuthSurface, isIndex } = routeInfo;
 
@@ -213,27 +261,25 @@ export default function RootLayout() {
 
     /**
      * ✅ QUALITY: if eligible user opens app, skip index/onboarding/paywall
-     * This prevents the “login/index flash” experience for signed-in pro users.
      */
-    if (isEligibleForTabs && (isIndex || routeInfo.isPaywall || routeInfo.isOnboarding)) {
+    if (
+      isEligibleForTabs &&
+      (isIndex || routeInfo.isPaywall || routeInfo.isOnboarding)
+    ) {
       safeReplace(ROUTES.tabsHome);
       return;
     }
 
     /**
-     * ✅ OPTIONAL: after a successful purchase / when pro becomes true,
-     * you can *optionally* prompt them to secure their account via Apple/Google.
-     * We do it only once per install using AsyncStorage.
-     *
-     * This will NOT block access to the app.
+     * ✅ OPTIONAL: once-per-install prompt to link identity (non-blocking)
      */
     (async () => {
       if (!userId) return;
       if (plan !== "pro") return;
       if (!onboardingComplete) return;
 
-      if (routeInfo.inAuthSurface) return; // don't redirect off login/link
-      if (routeInfo.inTabs) return; // don't interrupt in-app
+      if (routeInfo.inAuthSurface) return;
+      if (routeInfo.inTabs) return;
       if (didPostBootRedirect.current) return;
 
       try {
@@ -241,12 +287,9 @@ export default function RootLayout() {
         const seen = await AsyncStorage.getItem(key);
         if (seen) return;
 
-        // Mark seen first to avoid loops even if user backs out.
         await AsyncStorage.setItem(key, "true");
-
         didPostBootRedirect.current = true;
 
-        // Push them to link account, but it’s not required.
         safeReplace(ROUTES.link, { next: ROUTES.tabsHome });
       } catch {}
     })();
@@ -255,8 +298,9 @@ export default function RootLayout() {
     if (isLogin || inAuthSurface) return;
   }, [
     layoutReady,
-    hasHydrated,
     bootChecked,
+    hasHydrated,
+    hydrationTimedOut,
     userId,
     plan,
     onboardingComplete,
@@ -264,16 +308,31 @@ export default function RootLayout() {
     params,
   ]);
 
-  // ✅ Neutral splash while we check for an existing session (prevents login flash)
-  if (!layoutReady || !hasHydrated || !bootChecked) {
+  /**
+   * ✅ In-app boot screen (this is what you currently see as a spinner).
+   * We now show your splash logo while we finish boot checks.
+   *
+   * NOTE: Native splash is still controlled by app.config.js and requires rebuild to change.
+   */
+  if (!layoutReady || !bootChecked || (!hasHydrated && !hydrationTimedOut)) {
     return (
       <>
         <StatusBar style="light" />
         <LinearGradient colors={["#050505", "#0a0a0a"]} style={styles.splash}>
-          <ActivityIndicator size="large" color={C.accentA} />
-          <Text style={styles.splashText}>
-            {Platform.OS === "android" ? "Starting…" : "Loading…"}
-          </Text>
+          <View style={styles.splashInner}>
+            <Image
+              source={require("../assets/images/splash-icon.png")}
+              style={styles.logo}
+              resizeMode="contain"
+            />
+
+            <View style={styles.loadingRow}>
+              <ActivityIndicator size="small" color={C.accentA} />
+              <Text style={styles.splashText}>
+                {Platform.OS === "android" ? "Starting…" : "Loading…"}
+              </Text>
+            </View>
+          </View>
         </LinearGradient>
       </>
     );
@@ -300,8 +359,22 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     backgroundColor: C.bg,
   },
+  splashInner: {
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 24,
+  },
+  logo: {
+    width: 190,
+    height: 190,
+    marginBottom: 16,
+  },
+  loadingRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
   splashText: {
-    marginTop: 12,
     color: C.dim,
     fontSize: 13,
     fontWeight: "700",

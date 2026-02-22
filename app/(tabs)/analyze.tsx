@@ -15,6 +15,7 @@ import { LinearGradient } from "expo-linear-gradient";
 import { Ionicons, MaterialIcons, Feather } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { router } from "expo-router";
+import { useBottomTabBarHeight } from "@react-navigation/bottom-tabs";
 
 import { useCaptureStore } from "@/store/useCaptureStore";
 import { useAuthStore } from "@/store/useAuthStore";
@@ -75,6 +76,8 @@ async function getOnboardingCompleteFromStorage(): Promise<boolean> {
 }
 
 export default function Analyze() {
+  const tabBarHeight = useBottomTabBarHeight();
+
   const clearCapture = useCaptureStore((s) => s.clearAll);
 
   const userId = useAuthStore((s) => s.userId);
@@ -147,12 +150,18 @@ export default function Analyze() {
   );
 
   return (
-    <SafeAreaView style={styles.safe} edges={["top", "left", "right"]}>
+    <SafeAreaView
+      style={styles.safe}
+      edges={["top", "left", "right", "bottom"]}
+    >
       <StatusBar barStyle="light-content" />
 
       <ScrollView
         showsVerticalScrollIndicator={false}
-        contentContainerStyle={styles.scroll}
+        contentContainerStyle={[
+          styles.scroll,
+          { paddingBottom: tabBarHeight + 48 },
+        ]}
       >
         {/* HERO */}
         <View style={styles.heroWrap}>
@@ -176,7 +185,8 @@ export default function Analyze() {
                 <View style={{ flex: 1 }}>
                   <Text style={styles.title}>Start your scan</Text>
                   <Text style={styles.subtitle}>
-                    Take 3 photos (front • side • back). The AI has strict validation.
+                    Take 3 photos (front • side • back). The AI has strict
+                    validation.
                   </Text>
                 </View>
               </View>
@@ -188,7 +198,11 @@ export default function Analyze() {
                   <Text style={styles.metaText}>~30s</Text>
                 </View>
                 <View style={styles.metaPill}>
-                  <Ionicons name="lock-closed-outline" size={14} color="#CFFFA6" />
+                  <Ionicons
+                    name="lock-closed-outline"
+                    size={14}
+                    color="#CFFFA6"
+                  />
                   <Text style={styles.metaText}>On-device photos</Text>
                 </View>
               </View>
@@ -197,7 +211,9 @@ export default function Analyze() {
               <View style={styles.strictBox}>
                 <Ionicons name="warning-outline" size={16} color={C.warn} />
                 <Text style={styles.strictText}>
-                  <Text style={{ fontWeight: "900", color: C.text }}>Strict requirements:</Text>{" "}
+                  <Text style={{ fontWeight: "900", color: C.text }}>
+                    Strict requirements:
+                  </Text>{" "}
                   shirts and covered legs will be rejected.
                 </Text>
               </View>
@@ -214,7 +230,9 @@ export default function Analyze() {
               <Ionicons name="shirt-outline" size={18} color={C.warn} />
             </View>
             <Text style={styles.reqTitle}>Shirtless</Text>
-            <Text style={styles.reqDesc}>No shirts, hoodies, or compression tops.</Text>
+            <Text style={styles.reqDesc}>
+              No shirts, hoodies, or compression tops.
+            </Text>
           </View>
 
           <View style={styles.reqCard}>
@@ -222,7 +240,9 @@ export default function Analyze() {
               <Ionicons name="body-outline" size={18} color={C.warn} />
             </View>
             <Text style={styles.reqTitle}>Shorts or underwear</Text>
-            <Text style={styles.reqDesc}>Legs must be visible for accurate scoring.</Text>
+            <Text style={styles.reqDesc}>
+              Legs must be visible for accurate scoring.
+            </Text>
           </View>
         </View>
 
@@ -267,8 +287,8 @@ const styles = StyleSheet.create({
 
   scroll: {
     paddingHorizontal: 18,
-    paddingBottom: 28,
     paddingTop: Platform.OS === "android" ? 10 : 6,
+    paddingBottom: 28, // overridden dynamically in contentContainerStyle
   },
 
   /* HERO */

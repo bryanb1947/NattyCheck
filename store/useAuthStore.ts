@@ -32,8 +32,13 @@ type AuthState = {
   hasHydrated: boolean;
   hasBootstrappedSession: boolean;
 
+  // Cold-start behavior flags (used by app/_layout.tsx)
+  suppressGuestRestore: boolean;
+
   // Actions
   setHydrated: () => void;
+  setSuppressGuestRestore: (v: boolean) => void;
+
   setIdentity: (args: { userId: string; email?: string | null }) => void;
   setUser: (user: SetUserInput) => void;
 
@@ -71,12 +76,27 @@ function sanitizePlan(v: any): PlanType {
 
 function normalizeProfileToProOrFree(profile: any): PlanType {
   const norm = String(profile?.plan_normalized ?? "").trim().toLowerCase();
-  if (norm === "pro" || norm === "premium" || norm === "paid" || norm === "plus") return "pro";
+  if (
+    norm === "pro" ||
+    norm === "premium" ||
+    norm === "paid" ||
+    norm === "plus"
+  )
+    return "pro";
 
   const raw = String(profile?.plan_raw ?? "").trim().toLowerCase();
   if (raw.includes("appstore:") || raw.includes("revenuecat:")) return "pro";
 
   return "free";
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let t: any;
+  const timeout = new Promise<T>((_resolve, reject) => {
+    t = setTimeout(() => reject(new Error(`timeout:${label}`)), ms);
+  });
+
+  return Promise.race([p, timeout]).finally(() => clearTimeout(t));
 }
 
 /**
@@ -93,7 +113,11 @@ async function ensureSupabaseSession(opts?: { allowAnonymous?: boolean }) {
   ensureSessionInFlight = (async () => {
     // 1) restore existing
     try {
-      const { data, error } = await supabase.auth.getSession();
+      const { data, error } = await withTimeout(
+        supabase.auth.getSession(),
+        4000,
+        "getSession"
+      );
       if (error) console.log("🟦 Supabase getSession error:", error.message);
 
       const session = data?.session ?? null;
@@ -114,7 +138,11 @@ async function ensureSupabaseSession(opts?: { allowAnonymous?: boolean }) {
     }
 
     try {
-      const { data, error } = await supabase.auth.signInAnonymously();
+      const { data, error } = await withTimeout(
+        supabase.auth.signInAnonymously(),
+        6000,
+        "signInAnonymously"
+      );
       if (error) {
         console.log("🟦 signInAnonymously error:", error.message);
         return { userId: null, email: null, source: "none" as const };
@@ -152,11 +180,15 @@ async function ensureSupabaseSession(opts?: { allowAnonymous?: boolean }) {
  */
 async function ensureProfileRow(userId: string, email: string | null) {
   try {
-    const { data: existing, error: selErr } = await supabase
-      .from("profiles")
-      .select("user_id, email")
-      .eq("user_id", userId)
-      .maybeSingle();
+    const { data: existing, error: selErr } = await withTimeout(
+      supabase
+        .from("profiles")
+        .select("user_id, email")
+        .eq("user_id", userId)
+        .maybeSingle(),
+      5000,
+      "profiles.select"
+    );
 
     if (selErr) {
       console.log("🟨 profiles select error (non-fatal):", selErr.message);
@@ -164,14 +196,19 @@ async function ensureProfileRow(userId: string, email: string | null) {
     }
 
     if (!existing?.user_id) {
-      const { error: insErr } = await supabase.from("profiles").insert({
-        user_id: userId,
-        email: email ?? null,
-        plan_normalized: "free",
-        plan_raw: "free",
-      });
+      const { error: insErr } = await withTimeout(
+        supabase.from("profiles").insert({
+          user_id: userId,
+          email: email ?? null,
+          plan_normalized: "free",
+          plan_raw: "free",
+        }),
+        5000,
+        "profiles.insert"
+      );
 
-      if (insErr) console.log("🟨 profiles insert error (non-fatal):", insErr.message);
+      if (insErr)
+        console.log("🟨 profiles insert error (non-fatal):", insErr.message);
       else console.log("✅ profiles row created for user:", userId);
       return;
     }
@@ -181,15 +218,18 @@ async function ensureProfileRow(userId: string, email: string | null) {
     const incomingEmail = email ?? null;
 
     if (incomingEmail && incomingEmail !== existingEmail) {
-      const { error: upErr } = await supabase
-        .from("profiles")
-        .update({ email: incomingEmail })
-        .eq("user_id", userId);
+      const { error: upErr } = await withTimeout(
+        supabase
+          .from("profiles")
+          .update({ email: incomingEmail })
+          .eq("user_id", userId),
+        5000,
+        "profiles.updateEmail"
+      );
 
-      if (upErr) console.log("🟨 profiles email update error (non-fatal):", upErr.message);
+      if (upErr)
+        console.log("🟨 profiles email update error (non-fatal):", upErr.message);
       else console.log("✅ profiles email updated:", userId);
-    } else {
-      console.log("✅ profiles row ensured for user:", userId);
     }
   } catch (e: any) {
     console.log("🟨 ensureProfileRow crash (non-fatal):", e?.message ?? e);
@@ -205,11 +245,15 @@ async function fetchProfileGate(userId: string): Promise<{
   email: string | null;
 }> {
   try {
-    const { data: profile, error } = await supabase
-      .from("profiles")
-      .select("email, plan_normalized, plan_raw, onboarding_complete")
-      .eq("user_id", userId)
-      .maybeSingle();
+    const { data: profile, error } = await withTimeout(
+      supabase
+        .from("profiles")
+        .select("email, plan_normalized, plan_raw, onboarding_complete")
+        .eq("user_id", userId)
+        .maybeSingle(),
+      5000,
+      "profiles.fetchGate"
+    );
 
     if (error) {
       console.log("🟨 profiles fetch error (non-fatal):", error.message);
@@ -239,13 +283,15 @@ export const useAuthStore = create<AuthState>()(
       plan: "free",
       onboardingComplete: false,
 
-      // NEW: one-time save prompt flag
       didPromptSaveProgress: false,
 
       hasHydrated: false,
       hasBootstrappedSession: false,
 
+      suppressGuestRestore: false,
+
       setHydrated: () => set({ hasHydrated: true }),
+      setSuppressGuestRestore: (v) => set({ suppressGuestRestore: !!v }),
 
       setIdentity: ({ userId, email }) =>
         set((state) => ({ userId, email: email ?? state.email })),
@@ -270,14 +316,18 @@ export const useAuthStore = create<AuthState>()(
       setPlan: (plan) => set({ plan: sanitizePlan(plan) }),
       setOnboardingComplete: (v) => set({ onboardingComplete: !!v }),
 
-      setDidPromptSaveProgress: (v) => set({ didPromptSaveProgress: !!v }),
+      setDidPromptSaveProgress: (v) =>
+        set({ didPromptSaveProgress: !!v }),
 
       /**
        * Restore-only bootstrap (NO anon creation)
+       * Must never hang; all remote calls are timeout-wrapped.
        */
       bootstrapAuth: async () => {
         try {
-          const { userId, email, source } = await ensureSupabaseSession({ allowAnonymous: false });
+          const { userId, email, source } = await ensureSupabaseSession({
+            allowAnonymous: false,
+          });
 
           if (!userId) {
             console.log("🟦 No Supabase session found (restore-only).");
@@ -291,12 +341,23 @@ export const useAuthStore = create<AuthState>()(
             return;
           }
 
-          console.log("🟩 Supabase session restored:", { uid: userId, em: email ?? "", source });
+          console.log("🟩 Supabase session restored:", {
+            uid: userId,
+            em: email ?? "",
+            source,
+          });
 
-          await ensureProfileRow(userId, email);
+          // Set identity immediately so UI can proceed even if DB is slow
+          set((state) => ({
+            userId,
+            email: email ?? state.email,
+            hasBootstrappedSession: true,
+          }));
+
+          // Best-effort DB sync + gate fetch
+          await ensureProfileRow(userId, email ?? null);
 
           const gate = await fetchProfileGate(userId);
-
           set((state) => ({
             userId,
             email: email ?? gate.email ?? state.email,
@@ -322,29 +383,40 @@ export const useAuthStore = create<AuthState>()(
       ensureGuestSession: async () => {
         try {
           // If already have a session, do nothing
-          const existing = await ensureSupabaseSession({ allowAnonymous: false });
+          const existing = await ensureSupabaseSession({
+            allowAnonymous: false,
+          });
           if (existing.userId) {
             console.log("🟦 GuestSession skipped: session already exists.");
             return;
           }
 
-          const created = await ensureSupabaseSession({ allowAnonymous: true });
+          const created = await ensureSupabaseSession({
+            allowAnonymous: true,
+          });
           if (!created.userId) {
             console.log("🟦 GuestSession failed: no user created.");
             return;
           }
 
-          await ensureProfileRow(created.userId, created.email);
+          // Set identity immediately
+          set({
+            userId: created.userId,
+            email: created.email ?? null,
+            hasBootstrappedSession: true,
+          });
+
+          await ensureProfileRow(created.userId, created.email ?? null);
 
           const gate = await fetchProfileGate(created.userId);
 
-          set({
+          set((state) => ({
             userId: created.userId,
-            email: created.email ?? gate.email,
+            email: created.email ?? gate.email ?? state.email,
             plan: gate.plan,
             onboardingComplete: gate.onboardingComplete,
             hasBootstrappedSession: true,
-          });
+          }));
         } catch (e: any) {
           console.log("🟦 ensureGuestSession crash:", e?.message ?? e);
         }
@@ -353,37 +425,53 @@ export const useAuthStore = create<AuthState>()(
       startAuthListener: () => {
         if (authUnsub) return;
 
-        const { data } = supabase.auth.onAuthStateChange(async (_event, session) => {
-          const user = session?.user ?? null;
+        const { data } = supabase.auth.onAuthStateChange(
+          async (_event, session) => {
+            const user = session?.user ?? null;
 
-          if (!user?.id) {
-            console.log("🟦 Auth change: signed out");
+            if (!user?.id) {
+              console.log("🟦 Auth change: signed out");
 
-            // IMPORTANT: do NOT auto-create anon here anymore.
-            set({
-              userId: null,
-              email: null,
-              plan: "free",
-              onboardingComplete: false,
-              hasBootstrappedSession: true,
+              // IMPORTANT: do NOT auto-create anon here.
+              set({
+                userId: null,
+                email: null,
+                plan: "free",
+                onboardingComplete: false,
+                hasBootstrappedSession: true,
+              });
+              return;
+            }
+
+            console.log("🟩 Auth change: signed in", {
+              email: user.email ?? "",
+              uid: user.id,
             });
-            return;
+
+            // Set identity immediately so app doesn't hang if DB is slow
+            set((state) => ({
+              userId: user.id,
+              email: (user.email ?? state.email ?? null) as any,
+              hasBootstrappedSession: true,
+            }));
+
+            // Best-effort profile ensure + gate fetch (non-blocking to UI)
+            try {
+              await ensureProfileRow(user.id, user.email ?? null);
+              const gate = await fetchProfileGate(user.id);
+
+              set((state) => ({
+                userId: user.id,
+                email: (user.email ?? gate.email ?? state.email ?? null) as any,
+                plan: gate.plan,
+                onboardingComplete: gate.onboardingComplete,
+                hasBootstrappedSession: true,
+              }));
+            } catch (e: any) {
+              console.log("🟨 Auth listener gate fetch failed (non-fatal):", e?.message ?? e);
+            }
           }
-
-          console.log("🟩 Auth change: signed in", { email: user.email ?? "", uid: user.id });
-
-          await ensureProfileRow(user.id, user.email ?? null);
-
-          const gate = await fetchProfileGate(user.id);
-
-          set({
-            userId: user.id,
-            email: (user.email ?? gate.email ?? null) as any,
-            plan: gate.plan,
-            onboardingComplete: gate.onboardingComplete,
-            hasBootstrappedSession: true,
-          });
-        });
+        );
 
         authUnsub = () => data.subscription.unsubscribe();
       },
@@ -400,7 +488,7 @@ export const useAuthStore = create<AuthState>()(
        */
       logoutToLanding: async () => {
         try {
-          await supabase.auth.signOut();
+          await withTimeout(supabase.auth.signOut(), 4000, "signOut");
         } catch {}
 
         set({
@@ -417,7 +505,7 @@ export const useAuthStore = create<AuthState>()(
        */
       hardReset: async () => {
         try {
-          await supabase.auth.signOut();
+          await withTimeout(supabase.auth.signOut(), 4000, "signOut");
         } catch {}
 
         try {
@@ -432,12 +520,13 @@ export const useAuthStore = create<AuthState>()(
           didPromptSaveProgress: false,
           hasHydrated: true,
           hasBootstrappedSession: true,
+          suppressGuestRestore: false,
         });
       },
     }),
     {
       name: "auth",
-      version: 101, // bump because we added didPromptSaveProgress
+      version: 102, // bump because we added suppressGuestRestore + behavior changes
       storage: createJSONStorage(() => AsyncStorage),
 
       // Persist only stable UI/state (NOT identity)
@@ -455,10 +544,21 @@ export const useAuthStore = create<AuthState>()(
         didPromptSaveProgress: !!persistedState?.didPromptSaveProgress,
         hasHydrated: false,
         hasBootstrappedSession: false,
+        suppressGuestRestore: false,
       }),
 
       onRehydrateStorage: () => (state) => {
+        // Mark hydrated as soon as Zustand rehydrates persisted state.
         state?.setHydrated?.();
+
+        // Extra safety: if something weird happens, we still flip hydration soon.
+        setTimeout(() => {
+          const s = useAuthStore.getState();
+          if (!s.hasHydrated) {
+            console.log("🟧 [auth] hydration fallback — forcing hasHydrated=true");
+            useAuthStore.setState({ hasHydrated: true });
+          }
+        }, 750);
       },
     }
   )

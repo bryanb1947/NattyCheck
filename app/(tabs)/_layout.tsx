@@ -1,32 +1,18 @@
 // app/(tabs)/_layout.tsx
-import { useEffect } from "react";
+import React from "react";
 import { View, StyleSheet } from "react-native";
-import { Tabs, useRouter, useSegments } from "expo-router";
+import { Tabs } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
-import { useAuthStore } from "@/store/useAuthStore";
 
-const AUTH_LOGIN_ROUTE = "/login";
-
+/**
+ * TabsLayout should be "dumb":
+ * - No auth redirects here.
+ * - Root layout (app/_layout.tsx) is the single source of truth for routing/gating.
+ *
+ * This prevents router.replace() "fighting" during cold start and removes
+ * flash/loop edge cases caused by multiple redirect layers.
+ */
 export default function TabsLayout() {
-  const router = useRouter();
-  const segments = useSegments();
-
-  const userId = useAuthStore((s) => s.userId);
-  const hasHydrated = useAuthStore((s) => s.hasHydrated);
-  const hasBootstrappedSession = useAuthStore((s) => s.hasBootstrappedSession);
-
-  useEffect(() => {
-    if (!hasHydrated || !hasBootstrappedSession) return;
-
-    // If logged out, leave tabs. Avoid spamming replace if already in auth.
-    const first = segments[0] ?? "";
-    const inAuth = first === "login";
-
-    if (!userId && !inAuth) {
-      router.replace(AUTH_LOGIN_ROUTE);
-    }
-  }, [hasHydrated, hasBootstrappedSession, userId, router, segments]);
-
   return (
     <View style={styles.container}>
       <Tabs
